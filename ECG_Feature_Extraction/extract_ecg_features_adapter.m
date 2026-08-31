@@ -27,8 +27,9 @@ for t=1:numSeconds
     prior=find(rt<=t & isfinite(rr),1,'last'); if isempty(prior), current=NaN; else, current=rr(prior); end
     dr=diff(r); dr=dr(isfinite(dr));
     if nnz(good)>=2, p=polyfit(times(good),r(good),1); rslope=p(1); else, rslope=0; end
+    if any(good), rrMin=min(r(good)); rrMax=max(r(good)); else, rrMin=NaN; rrMax=NaN; end
     features(t,:)=[current 60/current mean(r,'omitnan') std(r,'omitnan') sqrt(mean(dr.^2,'omitnan')) ...
-        100*mean(abs(dr)>0.05,'omitnan') min(r,[],'omitnan') max(r,[],'omitnan') nnz(good) rslope];
+        100*mean(abs(dr)>0.05,'omitnan') rrMin rrMax nnz(good) rslope];
 end
 featureNames=names;
 end
