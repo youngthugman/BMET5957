@@ -33,7 +33,7 @@ Metrics are TP, TN, FP, FN, sensitivity, PPV, F1, specificity, and accuracy with
 ## Requirements
 
 - MATLAB (recent release with string arrays, `arguments`, `jsonencode`, and `matfile`)
-- Statistics and Machine Learning Toolbox (`fitcensemble`, `templateTree`, percentiles)
+- Statistics and Machine Learning Toolbox (`fitcensemble` and `templateTree`; required by the classifier)
 - Signal Processing Toolbox (`butter`, `filtfilt`, `findpeaks`, and the existing detector dependencies)
 
 ## Run
