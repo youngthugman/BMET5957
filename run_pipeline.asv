@@ -2,7 +2,7 @@
 %% USER CONFIGURATION
 
 % Location of the large dataset files
-trainDataPath = "C:\Users\maxas\Downloads\ProjectTrainData_ML.mat";
+trainDataPath = "C:\Users\maxas\Downloads\ProjectTrainData_.mat";
 
 testDataPath = "C:\Users\maxas\Downloads\ProjectTestData_ML.mat";
 
