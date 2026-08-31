@@ -12,7 +12,7 @@ for i=1:sourceInfo.numPatients
         if isfield(c,'extractionSignature') && strcmp(c.extractionSignature,signature), fprintf('%s patient %d/%d: cache reused\n',split,i,sourceInfo.numPatients); continue; end
     end
     r=load_patient_record(dataPath,i,isTrain);
-    if isTrain, labels=char(r.Class); else, tm=matfile(templatePath); z=tm.Class(i); labels=char(z{1}); end
+    if isTrain, labels=char(r.Class); else, tm=matfile(templatePath); z=tm.Class(1,i); labels=char(z{1}); end
     annotationLength=numel(labels);
     fprintf('%s patient %d/%d: ECG %d samples, %d seconds\n',split,i,sourceInfo.numPatients,numel(r.ECG),annotationLength);
     [ECGFeatures,ECGFeatureNames]=extract_ecg_features_adapter(r.ECG,config.ecg.sampleRate,annotationLength,config,r.QRS);
