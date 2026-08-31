@@ -1,8 +1,15 @@
 %% USER CONFIGURATION
-% Edit only these portable paths for a first run.
-trainDataPath = fullfile(pwd,"ProjectTrainData.mat");
-testDataPath = fullfile(pwd,"ProjectTestData.mat");
-testAnnotationTemplatePath = fullfile(pwd,"ProjectTestAnnotations.mat");
+%% USER CONFIGURATION
+
+% Location of the large dataset files
+trainDataPath = "C:\Users\maxas\Downloads\ProjectTrainData.mat";
+
+testDataPath = "C:\Users\maxas\Downloads\ProjectTestData (1).mat";
+
+testAnnotationTemplatePath = ...
+    "C:\Users\maxas\Downloads\ProjectTestAnnotations.mat";
+
+% Store generated results inside the Git project
 outputDirectory = fullfile(pwd,"Results");
 
 %% Configuration
