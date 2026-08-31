@@ -24,13 +24,14 @@ for s=1:size(scales,1)
     for t=1:numSeconds
         lo=max(1,t-b); hi=min(numSeconds,t+a); w=x(lo:hi); rel=(lo:hi)'-t;
         pre=x(lo:t); post=x(t:hi); cur=x(t); d=diff(w);
-        prebase=median(pre,'omitnan'); [mn,imin]=min(w,[],'omitnan'); [~,imax]=max(w,[],'omitnan');
+        prebase=median(pre,'omitnan'); windowMedian=median(w,'omitnan');
+        [mn,imin]=min(w,[],'omitnan'); [mx,imax]=max(w,[],'omitnan'); windowRange=mx-mn;
         drops=arrayfun(@(h) maxDrop(x,max(1,t-h),min(numSeconds,t+h),h),[5 10 20]);
         dp=arrayfun(@(h) cur-x(max(1,t-h)),[5 10 20]);
         df=arrayfun(@(h) x(min(numSeconds,t+h))-cur,[5 10 20]);
         baseline=max(prebase,cur); area=sum(max(0,baseline-w),'omitnan');
-        values=[cur mean(w,'omitnan') median(w,'omitnan') std(w,'omitnan') mn max(w,[],'omitnan') range(w) ...
-            prctile(w,10) prctile(w,90) max(w,[],'omitnan')-cur median(w,'omitnan')-cur prebase-cur drops ...
+        values=[cur mean(w,'omitnan') windowMedian std(w,'omitnan') mn mx windowRange ...
+            basePercentile(w,10) basePercentile(w,90) mx-cur windowMedian-cur prebase-cur drops ...
             min(post,[],'omitnan')-cur min(post,[],'omitnan')-prebase slope(rel,w) slope((lo:t)'-t,pre) slope((t:hi)'-t,post) ...
             min(d,[],'omitnan') max(d,[],'omitnan') mean(d,'omitnan') mean(abs(d),'omitnan') dp df area rel(imin) -rel(imax) ...
             slope((t:hi)'-t,post) countDrops(w,3) countDrops(w,4)];
@@ -41,3 +42,13 @@ end
 function v=slope(t,x), good=isfinite(t)&isfinite(x); if nnz(good)<2, v=0; else, p=polyfit(t(good),x(good),1); v=p(1); end, end
 function v=maxDrop(x,lo,hi,h), v=0; for k=lo:hi, v=max(v,x(k)-min(x(k:min(hi,k+h)),[],'omitnan')); end, end
 function n=countDrops(x,threshold), n=0; peak=x(1); active=false; for k=2:numel(x), peak=max(peak,x(k)); if peak-x(k)>=threshold && ~active, n=n+1; active=true; elseif x(k)>=peak-1, peak=x(k); active=false; end, end, end
+function q=basePercentile(x,p)
+%BASEPERCENTILE Linear percentile estimate without Statistics Toolbox.
+x=sort(x(~isnan(x))); n=numel(x);
+if n==0, q=NaN; return, end
+position=n*p/100+0.5;
+if position<=1, q=x(1); elseif position>=n, q=x(n); else
+    lower=floor(position); fraction=position-lower;
+    q=x(lower)+fraction*(x(lower+1)-x(lower));
+end
+end
