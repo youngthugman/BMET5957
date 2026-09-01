@@ -37,16 +37,14 @@ for fold = 1:numFolds
         XVal(bad,feature) = imputeMedian(feature);
     end
 
-    % Standardise using TRAINING mean and std only
-    featureMean = mean(XTrain,1);
-    featureStd = std(XTrain,0,1);
-    featureStd(featureStd == 0) = 1;
-
-    XTrain = (XTrain - featureMean) ./ featureStd;
-    XVal = (XVal - featureMean) ./ featureStd;
-
-    % Train temporary SVM for this fold
-    classifier = fitclinear(XTrain,YTrain,'Learner','svm');
+    % Train temporary neural network for this fold
+    classifier = fitcnet( ...
+        XTrain, ...
+        YTrain, ...
+        LayerSizes=[64 32 16], ...
+        Activations="relu", ...
+        Standardize=true, ...
+        Prior="uniform");
 
     % Predict patients not seen during training
     predicted = predict(classifier,XVal);
@@ -96,19 +94,17 @@ for feature = 1:size(X,2)
     X(bad,feature) = imputeMedian(feature);
 end
 
-featureMean = mean(X,1);
-featureStd = std(X,0,1);
-featureStd(featureStd == 0) = 1;
-
-X = (X - featureMean) ./ featureStd;
-
-classifier = fitclinear(X,Y,'Learner','svm');
+classifier = fitcnet( ...
+    X, ...
+    Y, ...
+    LayerSizes=[64 32 16], ...
+    Activations="relu", ...
+    Standardize=true, ...
+    Prior="uniform");
 
 model.classifier = classifier;
 model.imputeMedian = imputeMedian;
-model.featureMean = featureMean;
-model.featureStd = featureStd;
 
-fprintf("Final SVM trained using all patients.\n");
+fprintf("Final classification neural network trained using all patients.\n");
 
 end
