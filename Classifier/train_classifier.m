@@ -33,6 +33,10 @@ Sensitivity = zeros(numFolds,1);
 PPV = zeros(numFolds,1);
 F1 = zeros(numFolds,1);
 Accuracy = zeros(numFolds,1);
+oofScores = nan(size(Y));
+oofActual = strings(size(Y));
+oofCount = zeros(size(Y));
+aColumn = find(classNames == "A");
 
 for fold = 1:numFolds
     trainPatients = patients(training(cv,fold));
@@ -70,13 +74,17 @@ for fold = 1:numFolds
     net = trainnet(XTrain,YTrain,layers,lossFcn,options);
 
     scores = minibatchpredict(net,XVal,MiniBatchSize=miniBatchSize);
-    predicted = string(scores2label(scores,classNames));
+    aScores = gather(scores(:,aColumn));
+    predictedA = aScores >= 0.50;
     actual = string(YVal);
+    oofScores(valRows) = aScores;
+    oofActual(valRows) = actual;
+    oofCount(valRows) = oofCount(valRows) + 1;
 
-    TP = sum(predicted == "A" & actual == "A");
-    FP = sum(predicted == "A" & actual == "N");
-    FN = sum(predicted == "N" & actual == "A");
-    TN = sum(predicted == "N" & actual == "N");
+    TP = sum(predictedA & actual == "A");
+    FP = sum(predictedA & actual == "N");
+    FN = sum(~predictedA & actual == "A");
+    TN = sum(~predictedA & actual == "N");
 
     Sensitivity(fold) = safeDivide(TP,TP + FN);
     PPV(fold) = safeDivide(TP,TP + FP);
@@ -99,6 +107,62 @@ fprintf("Mean Accuracy    = %.4f\n",mean(Accuracy));
 fprintf("Std Sensitivity  = %.4f\n",std(Sensitivity));
 fprintf("Std PPV          = %.4f\n",std(PPV));
 fprintf("Std F1           = %.4f\n\n",std(F1));
+
+if any(oofCount ~= 1) || any(isnan(oofScores)) || any(oofActual == "")
+    error("Every sample must have exactly one out-of-fold prediction.");
+end
+
+% Threshold selection is based on OOF cross-validation predictions.
+% Final external evaluation is still required on the hidden test set.
+thresholds = (0.30:0.01:0.80)';
+numThresholds = numel(thresholds);
+thresholdSensitivity = zeros(numThresholds,1);
+thresholdPPV = zeros(numThresholds,1);
+thresholdF1 = zeros(numThresholds,1);
+thresholdAccuracy = zeros(numThresholds,1);
+for index = 1:numThresholds
+    [thresholdSensitivity(index),thresholdPPV(index),thresholdF1(index), ...
+        thresholdAccuracy(index)] = classificationMetrics( ...
+        oofScores >= thresholds(index),oofActual);
+end
+thresholdResults = table(thresholds,thresholdSensitivity,thresholdPPV, ...
+    thresholdF1,thresholdAccuracy,'VariableNames', ...
+    {'Threshold','Sensitivity','PPV','F1','Accuracy'});
+
+[~,bestF1Index] = max(thresholdF1);
+eligible = find(thresholdSensitivity >= 0.80);
+if isempty(eligible)
+    bestConstrainedF1Index = [];
+    bestConstrainedPPVIndex = [];
+    selectedIndex = bestF1Index;
+else
+    [~,relativeIndex] = max(thresholdF1(eligible));
+    bestConstrainedF1Index = eligible(relativeIndex);
+    [~,relativeIndex] = max(thresholdPPV(eligible));
+    bestConstrainedPPVIndex = eligible(relativeIndex);
+    selectedIndex = bestConstrainedF1Index;
+end
+selectedThreshold = thresholds(selectedIndex);
+
+printThreshold("Best F1 threshold",thresholdResults(bestF1Index,:));
+if isempty(bestConstrainedF1Index)
+    fprintf("\nNo threshold satisfies Sensitivity >= 0.80.\n");
+else
+    printThreshold("Best F1 threshold with Sensitivity >= 0.80", ...
+        thresholdResults(bestConstrainedF1Index,:));
+    printThreshold("Best PPV threshold with Sensitivity >= 0.80", ...
+        thresholdResults(bestConstrainedPPVIndex,:));
+end
+
+[defaultSensitivity,defaultPPV,defaultF1] = classificationMetrics( ...
+    oofScores >= 0.50,oofActual);
+fprintf("\nDefault threshold 0.50:\n");
+fprintf("  Sens = %.4f\n  PPV  = %.4f\n  F1   = %.4f\n", ...
+    defaultSensitivity,defaultPPV,defaultF1);
+fprintf("\nSelected threshold:\n");
+fprintf("  Threshold = %.2f\n  Sens = %.4f\n  PPV  = %.4f\n  F1   = %.4f\n\n", ...
+    selectedThreshold,thresholdSensitivity(selectedIndex), ...
+    thresholdPPV(selectedIndex),thresholdF1(selectedIndex));
 
 % Train the deployable model with preprocessing fitted to all available data.
 imputeMedian = median(X,1,'omitnan');
@@ -128,11 +192,13 @@ model.featureStd = featureStd;
 model.classNames = classNames;
 model.classWeightPower = classWeightPower;
 model.trainingInfo = trainingInfo;
+model.threshold = selectedThreshold;
 
 if ~exist("Results","dir")
     mkdir("Results");
 end
-save(fullfile("Results","trained_model.mat"),"model","results","-v7.3");
+save(fullfile("Results","trained_model.mat"),"model","results", ...
+    "thresholdResults","selectedThreshold","-v7.3");
 fprintf("Final Deep MLP model saved to Results/trained_model.mat\n");
 
 end
@@ -179,4 +245,22 @@ if denominator == 0
 else
     value = numerator / denominator;
 end
+end
+
+function [sensitivity,ppv,f1,accuracy] = classificationMetrics(predictedA,actual)
+TP = sum(predictedA & actual == "A");
+FP = sum(predictedA & actual == "N");
+FN = sum(~predictedA & actual == "A");
+TN = sum(~predictedA & actual == "N");
+sensitivity = safeDivide(TP,TP + FN);
+ppv = safeDivide(TP,TP + FP);
+f1 = safeDivide(2 * sensitivity * ppv,sensitivity + ppv);
+accuracy = safeDivide(TP + TN,TP + TN + FP + FN);
+end
+
+function printThreshold(titleText,row)
+fprintf("\n%s:\n",titleText);
+fprintf("Threshold = %.2f\n",row.Threshold);
+fprintf("Sens = %.4f\nPPV  = %.4f\nF1   = %.4f\nAcc  = %.4f\n", ...
+    row.Sensitivity,row.PPV,row.F1,row.Accuracy);
 end
