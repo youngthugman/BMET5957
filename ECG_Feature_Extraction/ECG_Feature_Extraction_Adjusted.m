@@ -1,6 +1,6 @@
-function [X_all,T_all,RecordID_all,EpochTime_all,FeatureNames] = ...
-    ECG_Feature_Extraction_Adjusted(ECG,QRS,Class,SR_ECG)
-%ECG_FEATURE_EXTRACTION_ADJUSTED Extract 125 ECG features per 60-second epoch.
+function [X,FeatureNames] = ...
+    ECG_Feature_Extraction_Adjusted(ecg,qrs,SR_ECG,nSeconds)
+%ECG_FEATURE_EXTRACTION_ADJUSTED Extract 125 ECG features at 1 Hz.
 %% ECG Feature Extraction for Apnoea Classification
 %
 % Corrected + Optimised version
@@ -9,12 +9,13 @@ function [X_all,T_all,RecordID_all,EpochTime_all,FeatureNames] = ...
 %   ApnoeaECG.mat
 %
 % Inputs:
-%   ECG   - ECG signal, 200 Hz
-%   QRS   - approximate QRS detections (sample indices)
-%   Class - 1 Hz class labels ('N' or 'A')
+%   ecg      - one patient's ECG signal
+%   qrs      - supplied approximate QRS detections (sample indices)
+%   SR_ECG   - ECG sampling rate
+%   nSeconds - number of 1 Hz annotation seconds
 %
 % Output:
-%   125 ECG/HRV/EDR/RSA features per 60-second epoch
+%   One row of 125 ECG/HRV/EDR/RSA features per annotation second
 %
 % Major corrections:
 %   - Preserve invalid RR gaps for successive-difference metrics
@@ -51,11 +52,13 @@ function [X_all,T_all,RecordID_all,EpochTime_all,FeatureNames] = ...
 % PARAMETERS
 % ========================================================
 
-if nargin < 4 || isempty(SR_ECG)
+if nargin < 3 || isempty(SR_ECG)
     SR_ECG = 200;
 end
+if nargin < 4
+    error('nSeconds is required to preserve annotation-level alignment.');
+end
 
-EpochLength = 60;
 WindowLength = 5*60;
 
 % ---------------------------------------------------------
@@ -291,15 +294,12 @@ end
 % DATA SIZE
 % ========================================================
 
-NumRecords = numel(ECG);
-
 fprintf('\n');
 fprintf('============================================\n');
 fprintf('ECG FEATURE EXTRACTION\n');
 fprintf('============================================\n');
-fprintf('Records: %d\n',NumRecords);
 fprintf('Features: %d\n',NumFeatures);
-fprintf('Epoch length: %d s\n',EpochLength);
+fprintf('Output interval: 1 s\n');
 fprintf('Feature window: %d s\n',WindowLength);
 fprintf('Max nonlinear RR samples: %g\n',MaxEntropyRR);
 fprintf('============================================\n\n');
@@ -308,34 +308,14 @@ fprintf('============================================\n\n');
 % OUTPUT CONTAINERS
 % ========================================================
 
-X_ECG = cell(NumRecords,1);
-T_ECG = cell(NumRecords,1);
-EpochTime_ECG = cell(NumRecords,1);
-
-CorrectedRPeaks = cell(NumRecords,1);
-RR_All = cell(NumRecords,1);
-
 totalTimer = tic;
 
 %% ========================================================
 % PROCESS RECORDS
 % ========================================================
 
-for record = 1:NumRecords
-
-    recordTimer = tic;
-
-    fprintf('Record %3d/%3d ... ',record,NumRecords);
-
-    %% -----------------------------------------------------
-    % LOAD RECORD
-    % -----------------------------------------------------
-
-    ecg = double(ECG{record}(:));
-    qrs = double(QRS{record}(:));
-
-    classLabels = Class{record};
-    classLabels = classLabels(:);
+    ecg = double(ecg(:));
+    qrs = double(qrs(:));
 
     NumSamples = numel(ecg);
 
@@ -406,8 +386,6 @@ for record = 1:NumRecords
 
     end
 
-    CorrectedRPeaks{record} = RPeaks;
-
     %% =====================================================
     % RR INTERVALS
     % =====================================================
@@ -415,8 +393,6 @@ for record = 1:NumRecords
     RR = diff(RPeaks)/SR_ECG;
 
     RR(RR < MinRR | RR > MaxRR) = NaN;
-
-    RR_All{record} = RR;
 
     % ------------------------------------------------------
     % Actual RR timestamps
@@ -638,79 +614,29 @@ for record = 1:NumRecords
     end
 
     %% =====================================================
-    % EPOCH SETUP
+    % PER-SECOND SETUP AND LOOP
     % =====================================================
 
-    NumEpochs = ...
-        floor(numel(classLabels)/EpochLength);
+    validateattributes(nSeconds, {'numeric'}, ...
+        {'scalar','integer','nonnegative','finite'});
+    X = nan(nSeconds,NumFeatures);
+    recordingDuration = NumSamples/SR_ECG;
 
-    X = nan(NumEpochs,NumFeatures);
+    for second = 1:nSeconds
 
-    T = strings(NumEpochs,1);
-
-    EpochTime = nan(NumEpochs,1);
-
-    %% =====================================================
-    % EPOCH LOOP
-    % =====================================================
-
-    for epoch = 1:NumEpochs
-
-        %% -------------------------------------------------
-        % CLASS LABEL
-        % -------------------------------------------------
-
-        epochStart = ...
-            (epoch-1)*EpochLength+1;
-
-        epochEnd = ...
-            epoch*EpochLength;
-
-        labels = ...
-            classLabels(epochStart:epochEnd);
-
-        if any(labels == 'A')
-
-            T(epoch) = "A";
-
-        elseif any(labels == 'N')
-
-            T(epoch) = "N";
-
-        else
-
-            T(epoch) = "N";
-
-        end
-
-        EpochTime(epoch) = ...
-            ((epochStart+epochEnd)/2)-1;
-
-        %% -------------------------------------------------
-        % CENTRED 5-MINUTE WINDOW
-        % -------------------------------------------------
-
-        centreTime = ...
-            (epochStart+epochEnd)/2;
-
-        windowStartTime = ...
-            max(1, ...
-            centreTime-WindowLength/2);
-
-        windowEndTime = ...
-            min(numel(classLabels), ...
-            centreTime+WindowLength/2);
+        % Annotation index 1 covers physical time [0,1), so its centre is
+        % 0.5 seconds. Signal and beat times below use that same origin.
+        centreTime = second-0.5;
+        windowStartTime = max(0, centreTime-WindowLength/2);
+        windowEndTime = min(recordingDuration, centreTime+WindowLength/2);
 
         %% -------------------------------------------------
         % ECG WINDOW
         % -------------------------------------------------
 
-        ecgStart = ...
-            round((windowStartTime-1)*SR_ECG)+1;
+        ecgStart = max(1, floor(windowStartTime*SR_ECG)+1);
 
-        ecgEnd = ...
-            min(NumSamples, ...
-            round(windowEndTime*SR_ECG));
+        ecgEnd = min(NumSamples, ceil(windowEndTime*SR_ECG));
 
         if ecgStart >= ecgEnd
 
@@ -1469,322 +1395,14 @@ for record = 1:NumRecords
 
         end
 
-        X(epoch,:) = values;
+        X(second,:) = values;
 
     end
 
-    %% =====================================================
-    % SAVE RECORD
-    % =====================================================
-
-    X_ECG{record} = X;
-    T_ECG{record} = T;
-    EpochTime_ECG{record} = EpochTime;
-
-    elapsed = toc(recordTimer);
-
-    fprintf('%.1f s (%d epochs)\n', ...
-        elapsed,NumEpochs);
+fprintf('ECG feature extraction complete: %d seconds x %d features (%.2f minutes).\n', ...
+    size(X,1),size(X,2),toc(totalTimer)/60);
 
 end
-
-%% ========================================================
-% COMBINE RECORDS
-% ========================================================
-
-fprintf('\nCombining records...\n');
-
-TotalEpochs = ...
-    sum(cellfun(@(x)size(x,1),X_ECG));
-
-X_all = ...
-    nan(TotalEpochs,NumFeatures);
-
-T_all = ...
-    strings(TotalEpochs,1);
-
-RecordID_all = ...
-    nan(TotalEpochs,1);
-
-EpochTime_all = ...
-    nan(TotalEpochs,1);
-
-row = 0;
-
-for record = 1:NumRecords
-
-    n = ...
-        size(X_ECG{record},1);
-
-    idx = ...
-        row+1:row+n;
-
-    X_all(idx,:) = ...
-        X_ECG{record};
-
-    T_all(idx) = ...
-        T_ECG{record};
-
-    RecordID_all(idx) = ...
-        record;
-
-    EpochTime_all(idx) = ...
-        EpochTime_ECG{record};
-
-    row = row+n;
-
-end
-
-%% ========================================================
-% SUMMARY
-% ========================================================
-
-totalTime = ...
-    toc(totalTimer);
-
-fprintf('\n');
-fprintf('============================================\n');
-fprintf('ECG FEATURE EXTRACTION COMPLETE\n');
-fprintf('============================================\n');
-
-fprintf('Number of records: %d\n',NumRecords);
-fprintf('Total epochs: %d\n',size(X_all,1));
-fprintf('Number of features: %d\n',size(X_all,2));
-
-fprintf('Normal epochs: %d\n', ...
-    sum(T_all=="N"));
-
-fprintf('Apnoea epochs: %d\n', ...
-    sum(T_all=="A"));
-
-fprintf('\nTotal runtime: %.2f minutes\n', ...
-    totalTime/60);
-
-fprintf('Average per record: %.2f seconds\n', ...
-    totalTime/NumRecords);
-
-%% ========================================================
-% FEATURE SUMMARY
-% ========================================================
-
-fprintf('\n');
-fprintf('FEATURE SUMMARY\n');
-fprintf('--------------------------------------------\n');
-
-for k = 1:NumFeatures
-
-    featureMean = ...
-        mean(X_all(:,k),'omitnan');
-
-    featureStd = ...
-        std(X_all(:,k),0,'omitnan');
-
-    fprintf( ...
-        '%-35s Mean = %10.4g   Std = %10.4g\n', ...
-        FeatureNames{k}, ...
-        featureMean, ...
-        featureStd);
-
-end
-
-%% ========================================================
-% NORMAL VS APNOEA
-% ========================================================
-
-fprintf('\n');
-fprintf('NORMAL VS APNOEA\n');
-fprintf('--------------------------------------------\n');
-
-normalIdx = ...
-    T_all=="N";
-
-apnoeaIdx = ...
-    T_all=="A";
-
-for k = 1:NumFeatures
-
-    normalMean = ...
-        mean(X_all(normalIdx,k),'omitnan');
-
-    apnoeaMean = ...
-        mean(X_all(apnoeaIdx,k),'omitnan');
-
-    fprintf( ...
-        '%-35s N = %10.4g   A = %10.4g\n', ...
-        FeatureNames{k}, ...
-        normalMean, ...
-        apnoeaMean);
-
-end
-
-%% ========================================================
-% AUTOMATIC FEATURE SANITY CHECK
-% ========================================================
-
-fprintf('\n');
-fprintf('FEATURE SANITY CHECK\n');
-fprintf('--------------------------------------------\n');
-
-for k = 1:NumFeatures
-
-    x = X_all(:,k);
-
-    finiteX = ...
-        x(isfinite(x));
-
-    if isempty(finiteX)
-
-        fprintf( ...
-            '%-35s ALL NaN/Inf\n', ...
-            FeatureNames{k});
-
-        continue;
-
-    end
-
-    nanCount = ...
-        sum(isnan(x));
-
-    infCount = ...
-        sum(isinf(x));
-
-    if nanCount > 0 || infCount > 0
-
-        fprintf( ...
-            '%-35s NaN = %d, Inf = %d\n', ...
-            FeatureNames{k}, ...
-            nanCount, ...
-            infCount);
-
-    end
-
-end
-
-%% ========================================================
-% FRACTION RANGE CHECKS
-% ========================================================
-
-fractionFeatures = { ...
-    'LF_Normalised'
-    'HF_Normalised'
-    'HF_PowerFraction'
-    'RespiratoryPowerFraction_HRV'
-    'EDR_R_RelativeRespPower'
-    'EDR_QRS_RelativeRespPower'
-    'EDR_Energy_RelativeRespPower'
-    'EDR_Area_RelativeRespPower'
-    'EDR_Slope_RelativeRespPower'};
-
-fprintf('\n');
-fprintf('FRACTION RANGE CHECKS\n');
-fprintf('--------------------------------------------\n');
-
-for i = 1:numel(fractionFeatures)
-
-    idx = ...
-        find(strcmp(FeatureNames, ...
-        fractionFeatures{i}),1);
-
-    if isempty(idx)
-        continue;
-    end
-
-    x = ...
-        X_all(:,idx);
-
-    x = ...
-        x(isfinite(x));
-
-    if isempty(x)
-        continue;
-    end
-
-    fprintf( ...
-        '%-35s Min = %.4g   Max = %.4g\n', ...
-        fractionFeatures{i}, ...
-        min(x), ...
-        max(x));
-
-    if min(x) < -1e-6 || ...
-            max(x) > 1+1e-6
-
-        fprintf( ...
-            'WARNING: %s contains values outside [0,1].\n', ...
-            fractionFeatures{i});
-
-    end
-
-end
-
-%% ========================================================
-% HRV POWER CONSISTENCY CHECK
-% ========================================================
-
-idxVLF = ...
-    find(strcmp(FeatureNames,'VLFPower'),1);
-
-idxLF = ...
-    find(strcmp(FeatureNames,'LFPower'),1);
-
-idxHF = ...
-    find(strcmp(FeatureNames,'HFPower'),1);
-
-idxTotal = ...
-    find(strcmp(FeatureNames,'TotalHRVPower'),1);
-
-if ~isempty(idxVLF) && ...
-        ~isempty(idxLF) && ...
-        ~isempty(idxHF) && ...
-        ~isempty(idxTotal)
-
-    VLF = X_all(:,idxVLF);
-    LF = X_all(:,idxLF);
-    HF = X_all(:,idxHF);
-    Total = X_all(:,idxTotal);
-
-    validPower = ...
-        isfinite(VLF) & ...
-        isfinite(LF) & ...
-        isfinite(HF) & ...
-        isfinite(Total);
-
-    if any(validPower)
-
-        powerError = ...
-            abs(Total(validPower) - ...
-            (VLF(validPower)+ ...
-            LF(validPower)+ ...
-            HF(validPower)));
-
-        maxPowerError = ...
-            max(powerError);
-
-        fprintf('\n');
-        fprintf('HRV POWER CONSISTENCY CHECK\n');
-        fprintf('Maximum |Total - (VLF+LF+HF)| = %.6g\n', ...
-            maxPowerError);
-
-        if maxPowerError > 1e-10
-
-            fprintf( ...
-                'WARNING: HRV power components are inconsistent.\n');
-
-        else
-
-            fprintf( ...
-                'HRV power components are internally consistent.\n');
-
-        end
-
-    end
-
-end
-
-end
-
-%% ========================================================
-% HRV FREQUENCY FEATURES
-% ========================================================
 
 function [ ...
     VLFPower, ...
