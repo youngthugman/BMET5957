@@ -59,7 +59,8 @@ if nargin < 4
     error('nSeconds is required to preserve annotation-level alignment.');
 end
 
-WindowLength = 5*60;
+% Feature context only; output remains one row per annotation second.
+WindowLength = 60;
 
 % ---------------------------------------------------------
 % QRS correction
