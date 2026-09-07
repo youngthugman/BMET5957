@@ -1,3 +1,6 @@
+function [X_all,T_all,RecordID_all,EpochTime_all,FeatureNames] = ...
+    ECG_Feature_Extraction_Adjusted(ECG,QRS,Class,SR_ECG)
+%ECG_FEATURE_EXTRACTION_ADJUSTED Extract 125 ECG features per 60-second epoch.
 %% ECG Feature Extraction for Apnoea Classification
 %
 % Corrected + Optimised version
@@ -48,8 +51,9 @@
 % PARAMETERS
 % ========================================================
 
-SR_ECG = 200;
-SR_SpO2 = 1;
+if nargin < 4 || isempty(SR_ECG)
+    SR_ECG = 200;
+end
 
 EpochLength = 60;
 WindowLength = 5*60;
@@ -1776,24 +1780,7 @@ if ~isempty(idxVLF) && ...
 
 end
 
-%% ========================================================
-% SAVE
-% ========================================================
-
-save('ECG_Features.mat', ...
-    'X_ECG', ...
-    'T_ECG', ...
-    'X_all', ...
-    'T_all', ...
-    'FeatureNames', ...
-    'CorrectedRPeaks', ...
-    'RR_All', ...
-    'EpochTime_ECG', ...
-    'RecordID_all', ...
-    'EpochTime_all');
-
-fprintf('\n');
-fprintf('Results saved to ECG_Features.mat\n');
+end
 
 %% ========================================================
 % HRV FREQUENCY FEATURES
