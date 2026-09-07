@@ -1,9 +1,9 @@
 %% This section 
 
 
-% Inputs are the data path and which patients we want to process e.g. 1:50
-% or something. Output is X = ecg features for each second of the patient,
-% Y = Matching N/A labels, patient ID and names of features.
+% Inputs are the data path and which patients we want to process e.g. 1:50.
+% Output is X = ECG and SpO2 features for each 60-second epoch, Y = matching
+% N/A labels, patient ID and names of features.
 function [X, Y, patientID, featureNames] = build_features(dataPath, patientIndices)
 data = matfile(dataPath); % do not use load() as its like 1.2 gb
 ecgSize = size(data, 'ECG'); 
@@ -28,6 +28,9 @@ for k = 1:numel(patientIndices)
     %Load ECG
     temp = data.ECG(1, patient);
     ecg = temp{1};
+    % Load the supplied approximate QRS detections used by the ECG extractor.
+    temp = data.QRS(1, patient);
+    qrs = temp{1};
     % loading labels
     temp = data.Class(1, patient);             
     labels = char(temp{1});
@@ -37,17 +40,27 @@ for k = 1:numel(patientIndices)
     temp = data.SpO2(1, patient);               
     spo2 = temp{1};
     
-   
-    [ECGFeatures, ecgNames] = extract_ecg_features(ecg, Fs, nSeconds); % call our ECG feature extractor now each second of patient has 10 features
-    [SpO2Features, spo2Names] = extract_spo2_features(spo2, FsSpO2,nSeconds);
+    [ECGFeatures, epochLabels, ~, epochTimes, ecgNames] = ...
+        ECG_Feature_Extraction_Adjusted({ecg}, {qrs}, {labels}, Fs);
+
+    % The ECG extractor emits one row per 60-second epoch. The SpO2
+    % extractor remains at 1 Hz, so retain the row at each epoch centre to
+    % align its centred five-minute window with the corresponding ECG row.
+    [SpO2FeaturesPerSecond, spo2Names] = ...
+        extract_spo2_features(spo2, FsSpO2, nSeconds);
+    spo2Rows = round(epochTimes + 0.5);
+    if any(spo2Rows < 1 | spo2Rows > nSeconds)
+        error("ECG epoch times do not align with the SpO2 feature rows.");
+    end
+    SpO2Features = SpO2FeaturesPerSecond(spo2Rows,:);
 
     patientFeatures = [ECGFeatures SpO2Features];       %combine features
     featuresByPatient{k} = patientFeatures;
-    labelsByPatient{k} = labels;
-    idByPatient{k} = repmat(patient,nSeconds,1);
+    labelsByPatient{k} = char(epochLabels);
+    idByPatient{k} = repmat(patient,size(patientFeatures,1),1);
     
     if isempty(featureNames)
-        featureNames = [ecgNames, spo2Names];
+        featureNames = [string(ecgNames(:)).', string(spo2Names(:)).'];
     end
 
     fprintf("  ECG features:  %d x %d\n", size(ECGFeatures,1), size(ECGFeatures,2));
@@ -55,8 +68,8 @@ for k = 1:numel(patientIndices)
     fprintf("  Combined:      %d x %d\n\n", size(patientFeatures,1), size(patientFeatures,2));
 end
 
-% each row represents 1 second and is labelled like
-% patientI--Second--feature1--feature2--...--label (N/A)
+% each row represents one 60-second epoch and is labelled like
+% patientI--Epoch--feature1--feature2--...--label (N/A)
 % Seperate rows but they align perfectly.
 X = vertcat(featuresByPatient{:}); % make vertical for ML
 Y = vertcat(labelsByPatient{:});   % make labels vertical
@@ -68,7 +81,6 @@ patientID = vertcat(idByPatient{:});
 
     
     
-
 
 
 
