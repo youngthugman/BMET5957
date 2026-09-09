@@ -1,36 +1,107 @@
 function net = train_cnn_windowed(XECG,XSpO2,Y)
-%TRAIN_CNN_WINDOWED Build or train the dual-branch, one-window/one-label CNN.
-% Stored observations are ECG 550-by-1 and SpO2 11-by-1 (time-by-channel).
+
+%TRAIN_CNN_WINDOWED
+% Dual-branch raw ECG + SpO2 CNN.
+%
+% ECG observation:
+%   550 x 1 = 11 seconds at 50 Hz
+%
+% SpO2 observation:
+%   11 x 1 = 11 seconds at 1 Hz
+%
+% Both branches retain temporal position through their convolutions.
+% The CENTRE learned feature is selected before fusion.
+%
+% Output:
+%   one N/A prediction for the centre second.
 
 layers = windowedNetwork();
 net = dlnetwork(layers);
 
-% A no-input call supports the required architecture check before CV starts.
+% Calling with no inputs only builds the network.
 if nargin == 0
     return
 end
 
-assert(size(XECG,1) == 550 && size(XECG,2) == 1,"ECG must be 550-by-1-by-N.");
-assert(size(XSpO2,1) == 11 && size(XSpO2,2) == 1,"SpO2 must be 11-by-1-by-N.");
-assert(size(XECG,3) == size(XSpO2,3) && size(XECG,3) == numel(Y), ...
+%% Input checks
+
+assert( ...
+    size(XECG,1) == 550 && ...
+    size(XECG,2) == 1, ...
+    "ECG must be 550-by-1-by-N.");
+
+assert( ...
+    size(XSpO2,1) == 11 && ...
+    size(XSpO2,2) == 1, ...
+    "SpO2 must be 11-by-1-by-N.");
+
+assert( ...
+    size(XECG,3) == size(XSpO2,3) && ...
+    size(XECG,3) == numel(Y), ...
     "Inputs and scalar targets must have equal observation counts.");
-assert(isequal(string(categories(Y)),["N";"A"]),"Class order must be [N, A].");
 
-% Derive weights only from windows selected from the training patients.
-counts = [sum(Y == "N"),sum(Y == "A")];
-assert(all(counts > 0),"Both N and A must occur in the training patients.");
-rawWeights = sum(counts)./counts;
-classWeights = rawWeights.^0.75;
-classWeights = reshape(classWeights/mean(classWeights),1,[]);
-lossFcn = @(scores,targets) crossentropy(scores,targets,classWeights, ...
-    WeightsFormat="UC",ClassificationMode="single-label");
+assert( ...
+    isequal(string(categories(Y)),["N";"A"]), ...
+    "Class order must be [N, A].");
 
-ecgStore = arrayDatastore(XECG,IterationDimension=3);
-spo2Store = arrayDatastore(XSpO2,IterationDimension=3);
-labelStore = arrayDatastore(Y,IterationDimension=1);
-trainingData = combine(ecgStore,spo2Store,labelStore);
+%% Training-only class weights
 
-options = trainingOptions("adam", ...
+counts = [ ...
+    sum(Y == "N"), ...
+    sum(Y == "A")];
+
+assert(all(counts > 0), ...
+    "Both N and A must occur in the training patients.");
+
+rawWeights = sum(counts) ./ counts;
+
+classWeights = rawWeights .^ 0.75;
+classWeights = classWeights / mean(classWeights);
+
+classWeights = ...
+    single(reshape(classWeights,1,[]));
+
+fprintf("Training windows: %d\n",numel(Y));
+fprintf("Training N: %d\n",counts(1));
+fprintf("Training A: %d\n",counts(2));
+
+fprintf( ...
+    "Class weights [N A]: [%.3f %.3f]\n", ...
+    classWeights(1), ...
+    classWeights(2));
+
+%% Training datastores
+
+ecgStore = arrayDatastore( ...
+    XECG, ...
+    IterationDimension=3);
+
+spo2Store = arrayDatastore( ...
+    XSpO2, ...
+    IterationDimension=3);
+
+labelStore = arrayDatastore( ...
+    Y, ...
+    IterationDimension=1);
+
+trainingData = combine( ...
+    ecgStore, ...
+    spo2Store, ...
+    labelStore);
+
+%% Weighted cross-entropy
+
+lossFcn = @(scores,targets) crossentropy( ...
+    scores, ...
+    targets, ...
+    classWeights, ...
+    WeightsFormat="UC", ...
+    ClassificationMode="single-label");
+
+%% Training options
+
+options = trainingOptions( ...
+    "adam", ...
     MaxEpochs=10, ...
     MiniBatchSize=512, ...
     InitialLearnRate=1e-3, ...
@@ -40,49 +111,259 @@ options = trainingOptions("adam", ...
     Verbose=true, ...
     Plots="none");
 
-net = trainnet(trainingData,net,lossFcn,options);
+%% Train
+
+net = trainnet( ...
+    trainingData, ...
+    net, ...
+    lossFcn, ...
+    options);
+
 end
 
+
 function net = windowedNetwork()
+
+%% ECG branch
+%
+% Temporal dimensions:
+%
+% 550 samples
+% -> conv stride 2       = 275
+% -> pool stride 5       = 55
+% -> conv                = 55
+% -> pool stride 5       = 11
+% -> conv                = 11
+%
+% Final ECG sequence:
+%   64 channels x 11 temporal positions
+%
+% Receptive field of one final temporal position:
+%   549 ECG samples
+%   549 / 50 = 10.98 seconds
+%
+% We select final temporal position 6.
+
 ecgBranch = [
-    sequenceInputLayer(1,Normalization="none",MinLength=550,Name="ecg")
-    convolution1dLayer(101,16,Padding="same",Stride=2,Name="ecg_conv1")
-    batchNormalizationLayer(Name="ecg_bn1")
-    reluLayer(Name="ecg_relu1")
-    maxPooling1dLayer(5,Stride=5,Name="ecg_pool1")
-    convolution1dLayer(11,32,Padding="same",Name="ecg_conv2")
-    batchNormalizationLayer(Name="ecg_bn2")
-    reluLayer(Name="ecg_relu2")
-    maxPooling1dLayer(5,Stride=5,Name="ecg_pool2")
-    convolution1dLayer(7,64,Padding="same",Name="ecg_conv3")
-    batchNormalizationLayer(Name="ecg_bn3")
-    reluLayer(Name="ecg_relu3")
-    flattenLayer(Name="ecg_flatten")];
+
+    sequenceInputLayer( ...
+        1, ...
+        Normalization="none", ...
+        MinLength=550, ...
+        Name="ecg")
+
+    convolution1dLayer( ...
+        101, ...
+        16, ...
+        Padding="same", ...
+        Stride=2, ...
+        Name="ecg_conv1")
+
+    batchNormalizationLayer( ...
+        Name="ecg_bn1")
+
+    reluLayer( ...
+        Name="ecg_relu1")
+
+    maxPooling1dLayer( ...
+        5, ...
+        Stride=5, ...
+        Name="ecg_pool1")
+
+    convolution1dLayer( ...
+        11, ...
+        32, ...
+        Padding="same", ...
+        Name="ecg_conv2")
+
+    batchNormalizationLayer( ...
+        Name="ecg_bn2")
+
+    reluLayer( ...
+        Name="ecg_relu2")
+
+    maxPooling1dLayer( ...
+        5, ...
+        Stride=5, ...
+        Name="ecg_pool2")
+
+    convolution1dLayer( ...
+        7, ...
+        64, ...
+        Padding="same", ...
+        Name="ecg_conv3")
+
+    batchNormalizationLayer( ...
+        Name="ecg_bn3")
+
+    reluLayer( ...
+        Name="ecg_relu3")
+
+    functionLayer( ...
+        @takeCentreTime, ...
+        Formattable=true, ...
+        Acceleratable=true, ...
+        Name="ecg_centre")
+    ];
+
+%% SpO2 branch
+%
+% All convolutions use stride 1 and same padding.
+%
+% 11 samples remain 11 temporal positions.
+%
+% Receptive field:
+%   conv 5 -> 5 seconds
+%   conv 5 -> 9 seconds
+%   conv 3 -> 11 seconds
+%
+% The feature at temporal position 6 therefore contains information
+% from the complete 11-second SpO2 window.
 
 spo2Branch = [
-    sequenceInputLayer(1,Normalization="none",MinLength=11,Name="spo2")
-    convolution1dLayer(5,8,Padding="same",Name="spo2_conv1")
-    reluLayer(Name="spo2_relu1")
-    convolution1dLayer(5,16,Padding="same",Name="spo2_conv2")
-    reluLayer(Name="spo2_relu2")
-    convolution1dLayer(3,16,Padding="same",Name="spo2_conv3")
-    reluLayer(Name="spo2_relu3")
-    flattenLayer(Name="spo2_flatten")];
+
+    sequenceInputLayer( ...
+        1, ...
+        Normalization="none", ...
+        MinLength=11, ...
+        Name="spo2")
+
+    convolution1dLayer( ...
+        5, ...
+        8, ...
+        Padding="same", ...
+        Name="spo2_conv1")
+
+    reluLayer( ...
+        Name="spo2_relu1")
+
+    convolution1dLayer( ...
+        5, ...
+        16, ...
+        Padding="same", ...
+        Name="spo2_conv2")
+
+    reluLayer( ...
+        Name="spo2_relu2")
+
+    convolution1dLayer( ...
+        3, ...
+        16, ...
+        Padding="same", ...
+        Name="spo2_conv3")
+
+    reluLayer( ...
+        Name="spo2_relu3")
+
+    functionLayer( ...
+        @takeCentreTime, ...
+        Formattable=true, ...
+        Acceleratable=true, ...
+        Name="spo2_centre")
+    ];
+
+%% Fusion
+%
+% ECG centre feature:
+%   64 values
+%
+% SpO2 centre feature:
+%   16 values
+%
+% Combined:
+%   80 values
+%
+% Then ONE classification for the centre second.
 
 fusion = [
-    concatenationLayer(1,2,Name="fusion")
-    fullyConnectedLayer(128,Name="fc1")
-    reluLayer(Name="fusion_relu1")
-    dropoutLayer(0.25,Name="dropout")
-    fullyConnectedLayer(32,Name="fc2")
-    reluLayer(Name="fusion_relu2")
-    fullyConnectedLayer(2,Name="scores")
-    softmaxLayer(Name="probabilities")];
+
+    concatenationLayer( ...
+        1, ...
+        2, ...
+        Name="fusion")
+
+    fullyConnectedLayer( ...
+        128, ...
+        Name="fc1")
+
+    reluLayer( ...
+        Name="fusion_relu1")
+
+    dropoutLayer( ...
+        0.25, ...
+        Name="dropout")
+
+    fullyConnectedLayer( ...
+        32, ...
+        Name="fc2")
+
+    reluLayer( ...
+        Name="fusion_relu2")
+
+    fullyConnectedLayer( ...
+        2, ...
+        Name="scores")
+
+    softmaxLayer( ...
+        Name="probabilities")
+    ];
+
+%% Assemble network
 
 net = layerGraph();
+
 net = addLayers(net,ecgBranch);
 net = addLayers(net,spo2Branch);
 net = addLayers(net,fusion);
-net = connectLayers(net,"ecg_flatten","fusion/in1");
-net = connectLayers(net,"spo2_flatten","fusion/in2");
+
+net = connectLayers( ...
+    net, ...
+    "ecg_centre", ...
+    "fusion/in1");
+
+net = connectLayers( ...
+    net, ...
+    "spo2_centre", ...
+    "fusion/in2");
+
+end
+
+
+function Y = takeCentreTime(X)
+
+%TAKECENTRETIME Select the centre temporal feature.
+%
+% Input during training is formatted approximately as:
+%
+%   C x B x T
+%
+% We explicitly locate the time dimension rather than assuming which
+% physical array dimension contains time.
+
+timeDim = finddim(X,"T");
+
+assert(~isempty(timeDim), ...
+    "Centre-selection layer expected a time dimension.");
+
+numTimeSteps = size(X,timeDim);
+
+assert(mod(numTimeSteps,2) == 1, ...
+    "Centre-selection layer requires an odd number of time positions.");
+
+centreIndex = (numTimeSteps + 1) / 2;
+
+% Index every dimension normally except time.
+subs = repmat({':'},1,ndims(X));
+subs{timeDim} = centreIndex;
+
+Y = X(subs{:});
+
+% After selecting one temporal position, remove the singleton time
+% dimension and explicitly return channel-by-batch data.
+%
+% R2026a requires functionLayer outputs to retain an explicit valid
+% format when Formattable=true.
+Y = stripdims(Y,"CBT");
+Y = dlarray(Y,"CB");
+
 end
