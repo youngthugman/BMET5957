@@ -198,17 +198,29 @@ for fold = 1:5
     fprintf("Fold %d: Sens = %.4f, PPV = %.4f, F1 = %.4f, Accuracy = %.4f\n", ...
         fold,metrics(fold,1),metrics(fold,2),metrics(fold,3),metrics(fold,4));
 
-    foldRows = find(valRows);
-    % Predictions were generated in valPatients order; map them by patient ID.
-    for k = 1:numel(foldRows)
-        row = foldRows(k);
-        match = find(foldPatientID == patientID(row));
-        patientRows = foldRows(patientID(foldRows) == patientID(row));
-        position = find(patientRows == row,1);
-        oofProbabilityA(row) = foldProbabilityA(match(position));
-        oofCount(row) = oofCount(row) + 1;
-    end
+%% Map validation predictions back to original rows
 
+    for patientIndex = 1:numel(valPatients)
+    
+        p = valPatients(patientIndex);
+    
+        % Original rows belonging to this validation patient.
+        patientRows = find(patientID == p);
+    
+        % Predictions belonging to this patient.
+        predictionRows = foldPatientID == p;
+    
+        assert( ...
+            sum(predictionRows) == numel(patientRows), ...
+            "OOF prediction count mismatch for patient %d.",p);
+    
+        oofProbabilityA(patientRows) = ...
+            foldProbabilityA(predictionRows);
+    
+        oofCount(patientRows) = ...
+            oofCount(patientRows) + 1;
+    
+    end
     foldResult.validationPatientIDs = valPatients;
     foldResult.truth = foldTruth;
     foldResult.probabilityA = foldProbabilityA;
