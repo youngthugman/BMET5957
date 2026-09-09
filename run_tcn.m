@@ -52,13 +52,9 @@ assert(~any(isundefined(Y)),"Y must contain exactly the labels N and A.");
 assert(isequal(string(categories(Y)),["N";"A"]), ...
     "Categorical class order must be N followed by A.");
 
-expectedPatients = [1 3 9 12 15 17 18 30 33 36 37 38 42 47 50 57 61 72 77 94];
-rng(1);
-patients = sort(randperm(100,20));
-assert(isequal(patients,expectedPatients), ...
-    "The deterministic 20-patient development subset has changed.");
+patients = 1:100;
 assert(all(ismember(patients,unique(patientID))), ...
-    "The cache does not contain every selected development patient.");
+    "The cache does not contain all 100 patients required for cross-validation.");
 
 selectedRows = ismember(patientID,patients);
 X = X(selectedRows,:);
@@ -228,7 +224,7 @@ assert(all(oofCount == 1) && all(isfinite(oofProbabilityA)), ...
     "Every selected second must receive exactly one OOF prediction.");
 oofTruth = Y;
 oofPatientID = patientID;
-save(fullfile(resultsPath,"tcn_20patient_oof.mat"), ...
+save(fullfile(resultsPath,"tcn_100patient_oof.mat"), ...
     "oofProbabilityA","oofTruth","oofPatientID", ...
     "selectedFeatureNames","patients","-v7.3");
 
