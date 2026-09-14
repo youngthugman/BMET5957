@@ -315,7 +315,7 @@ def patient_performance(y, probability, patient_id, best_threshold):
 
 
 def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
-                         cv_mode="5fold"):
+                         cv_mode="5fold", feature_set="all", train_final_model=True):
     assert x.shape[0] == y.size == patient_id.size
     assert set(np.unique(y)).issubset({0, 1}) and 1 in y, "A must be positive class 1"
     patients = np.unique(patient_id)
@@ -371,7 +371,8 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
         print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*fold_metrics.mean(0)))
         print(f"  Std fold F1={fold_metrics[:, 2].std():.4f}")
     pooled = metrics(y, oof)
-    print("Pooled OOF at threshold 0.50")
+    evaluation_name = "LOPO" if cv_mode == "logo" else "OOF"
+    print(f"Pooled {evaluation_name} at threshold 0.50")
     print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*pooled))
     thresholds = np.arange(0.10, 0.901, 0.01)
     swept = np.asarray([metrics(y, oof, threshold) for threshold in thresholds])
@@ -380,11 +381,13 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
     print("  threshold={:.2f}  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}"
           .format(thresholds[best], *swept[best]))
     results_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(results_dir / f"oof_predictions_{cv_mode}.npz", probability_a=oof,
+    np.savez_compressed(results_dir / f"oof_predictions_{cv_mode}_{feature_set}.npz",
+                        probability_a=oof,
                         y_true=y, patient_id=patient_id, threshold_0_50=np.float32(0.5),
                         best_oof_threshold=np.float32(thresholds[best]))
     patient_results = patient_performance(y, oof, patient_id, thresholds[best])
-    patient_results.to_csv(results_dir / f"patient_performance_{cv_mode}.csv", index=False)
+    patient_results.to_csv(
+        results_dir / f"patient_performance_{cv_mode}_{feature_set}.csv", index=False)
 
     if cv_mode == "logo":
         patient_scores = patient_results[["sensitivity_050", "ppv_050", "f1_050",
@@ -407,15 +410,65 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
         print("\nWorst 10 patients by F1 at threshold 0.50 (A_seconds > 0)")
         print(rankable.nsmallest(10, "f1_050")[rank_columns].to_string(index=False))
 
-    negative, positive = np.bincount(y, minlength=2)
-    final_model, _ = fit_model(x, y, device, float(np.sqrt(negative / positive)))
-    importance = pd.DataFrame({"feature": feature_names,
-                               "importance": final_model.feature_importances_})
-    importance = importance.sort_values("importance", ascending=False)
-    importance.to_csv(results_dir / "feature_importance.csv", index=False)
-    final_model.save_model(str(results_dir / "xgboost_model.json"))
-    print("\nTop 20 feature importances")
-    print(importance.head(20).to_string(index=False))
+    if train_final_model:
+        negative, positive = np.bincount(y, minlength=2)
+        final_model, _ = fit_model(x, y, device, float(np.sqrt(negative / positive)))
+        importance = pd.DataFrame({"feature": feature_names,
+                                   "importance": final_model.feature_importances_})
+        importance = importance.sort_values("importance", ascending=False)
+        importance.to_csv(results_dir / f"feature_importance_{feature_set}.csv", index=False)
+        final_model.save_model(str(results_dir / f"xgboost_model_{feature_set}.json"))
+        print("\nTop 20 feature importances")
+        print(importance.head(20).to_string(index=False))
+
+    return {"feature_set": feature_set, "features": x.shape[1], "pooled": pooled,
+            "patient_results": patient_results}
+
+
+def print_ablation_comparison(results, results_dir):
+    """Save and display pooled and patient-level feature-ablation comparisons."""
+    labels = {"ecg": "ECG only", "spo2": "SpO2 only", "all": "All"}
+    summary_rows = []
+    for result in results:
+        patient_f1 = result["patient_results"]["f1_050"]
+        pooled = result["pooled"]
+        summary_rows.append({
+            "feature_set": labels[result["feature_set"]],
+            "features": result["features"],
+            "sensitivity": pooled[0], "ppv": pooled[1], "pooled_f1": pooled[2],
+            "accuracy": pooled[3], "mean_patient_f1": patient_f1.mean(),
+            "median_patient_f1": patient_f1.median(),
+            "std_patient_f1": patient_f1.std(ddof=0),
+            "patient_f1_25th_percentile": patient_f1.quantile(.25),
+            "patient_f1_75th_percentile": patient_f1.quantile(.75),
+        })
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(results_dir / "feature_ablation_summary.csv", index=False)
+    print("\nFeature ablation comparison at threshold 0.50")
+    display_columns = ["feature_set", "features", "sensitivity", "ppv", "pooled_f1",
+                       "accuracy", "median_patient_f1"]
+    print(summary[display_columns].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+    f1 = summary.set_index("feature_set")["pooled_f1"]
+    print(f"\nAll - SpO2 F1 = {f1['All'] - f1['SpO2 only']:+.4f}")
+    print(f"All - ECG F1 = {f1['All'] - f1['ECG only']:+.4f}")
+
+    by_set = {result["feature_set"]: result["patient_results"].set_index("patient_id")
+              for result in results}
+    comparison = by_set["all"][["A_seconds", "A_prevalence"]].copy()
+    for metric, source_column in (("f1", "f1_050"),
+                                  ("sensitivity", "sensitivity_050"),
+                                  ("ppv", "ppv_050")):
+        for feature_set in ("ecg", "spo2", "all"):
+            patient = by_set[feature_set]
+            comparison[f"{metric}_{feature_set}"] = patient[source_column]
+    comparison["all_minus_spo2_f1"] = comparison["f1_all"] - comparison["f1_spo2"]
+    comparison["all_minus_ecg_f1"] = comparison["f1_all"] - comparison["f1_ecg"]
+    comparison = comparison.reset_index()
+    comparison.to_csv(results_dir / "feature_ablation_patient_comparison.csv", index=False)
+    print("\n10 patients where adding ECG to SpO2 improves F1 the most")
+    print(comparison.nlargest(10, "all_minus_spo2_f1").to_string(index=False))
+    print("\n10 patients where adding ECG to SpO2 hurts F1 the most")
+    print(comparison.nsmallest(10, "all_minus_spo2_f1").to_string(index=False))
 
 
 def main():
@@ -425,17 +478,39 @@ def main():
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--cv", choices=("5fold", "logo"), default="5fold",
                         help="Patient-wise cross-validation method")
+    parser.add_argument("--features", choices=("all", "ecg", "spo2", "compare"),
+                        default="all", help="Feature set to evaluate")
     parser.add_argument("--rebuild-cache", action="store_true")
     args = parser.parse_args()
+    if args.features == "compare" and args.cv != "logo":
+        parser.error("--features compare requires --cv logo for LOPO feature ablation")
     root = Path(__file__).resolve().parent
     selected = DEV20 if args.patients == "dev20" else None
     cache_path = root / "cache" / "train_features.npz"
     x, y, patient_id, feature_names = load_or_build_cache(args, selected, cache_path)
+    feature_names = feature_names.astype(str)
+    feature_masks = {
+        "ecg": np.char.startswith(feature_names, "ecg_"),
+        "spo2": np.char.startswith(feature_names, "spo2_"),
+        "all": np.ones(feature_names.size, dtype=bool),
+    }
+    if not feature_masks["ecg"].any() or not feature_masks["spo2"].any():
+        raise ValueError("Cached feature_names must contain both ecg_ and spo2_ features")
     print(f"\nPatients: {np.unique(patient_id).size}\nSeconds: {y.size:,}"
           f"\nA labels: {(y == 1).sum():,}\nN labels: {(y == 0).sum():,}"
           f"\nFeatures: {x.shape[1]}\nFeature matrix RAM: {x.nbytes / 2**30:.2f} GiB")
-    run_cross_validation(x, y, patient_id, feature_names,
-                         choose_device(args.device), root / "results", args.cv)
+    labels = {"ecg": "ECG only", "spo2": "SpO2 only", "all": "All"}
+    requested_sets = ("ecg", "spo2", "all") if args.features == "compare" else (args.features,)
+    device = choose_device(args.device)
+    results = []
+    for feature_set in requested_sets:
+        mask = feature_masks[feature_set]
+        print(f"\n{'=' * 72}\n{labels[feature_set]}: {mask.sum()} features\n{'=' * 72}")
+        results.append(run_cross_validation(
+            x[:, mask], y, patient_id, feature_names[mask], device, root / "results",
+            args.cv, feature_set, train_final_model=args.features != "compare"))
+    if args.features == "compare":
+        print_ablation_comparison(results, root / "results")
 
 
 if __name__ == "__main__":
