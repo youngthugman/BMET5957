@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Small patient-wise XGBoost benchmark for ProjectTrainData.mat."""
+
+import argparse
+import subprocess
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pandas as pd
+from scipy.io import loadmat
+from scipy.ndimage import median_filter
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import GroupKFold
+from tqdm import tqdm
+from xgboost import XGBClassifier
+
+try:
+    from sklearn.model_selection import StratifiedGroupKFold
+except ImportError:  # scikit-learn before 1.1
+    StratifiedGroupKFold = None
+
+
+DEV20 = np.array([1, 3, 9, 12, 15, 17, 18, 30, 33, 36, 37, 38,
+                  42, 47, 50, 57, 61, 72, 77, 94])
+FIELDS = ("ECG", "SpO2", "Class", "QRS", "SR_ECG", "SR_SpO2")
+
+
+def _scipy_cells(value):
+    """Turn a regular MAT cell array (or scalar) into a patient list."""
+    value = np.asarray(value)
+    if value.dtype == object:
+        return [np.asarray(x).squeeze() for x in value.ravel(order="F")]
+    if value.ndim <= 1:
+        return [value.squeeze()]
+    return [value[:, i].squeeze() for i in range(value.shape[1])]
+
+
+def _hdf5_value(handle, item):
+    array = np.asarray(handle[item]) if isinstance(item, h5py.Reference) else np.asarray(item)
+    # MATLAB stores arrays transposed in v7.3 files; vectors are unaffected.
+    return array.T.squeeze()
+
+
+def _hdf5_cells(handle, name):
+    dataset = handle[name]
+    if h5py.check_dtype(ref=dataset.dtype) is not None:
+        return [_hdf5_value(handle, ref) for ref in dataset[()].ravel(order="F")]
+    array = np.asarray(dataset).T
+    if array.size == 1:
+        return [array.squeeze()]
+    if array.ndim == 1 or 1 in array.shape:
+        return [np.asarray(x) for x in array.ravel(order="F")]
+    return [array[:, i].squeeze() for i in range(array.shape[1])]
+
+
+def load_training_data(path):
+    """Load both ordinary and MATLAB v7.3/HDF5 MAT files."""
+    if h5py.is_hdf5(path):
+        with h5py.File(path, "r") as handle:
+            missing = [name for name in FIELDS if name not in handle]
+            if missing:
+                raise ValueError(f"MAT file is missing: {', '.join(missing)}")
+            return {name: _hdf5_cells(handle, name) for name in FIELDS}
+    raw = loadmat(path, variable_names=FIELDS, squeeze_me=False)
+    missing = [name for name in FIELDS if name not in raw]
+    if missing:
+        raise ValueError(f"MAT file is missing: {', '.join(missing)}")
+    return {name: _scipy_cells(raw[name]) for name in FIELDS}
+
+
+def scalar_rate(values, patient_index, name):
+    item = values[patient_index] if len(values) > 1 else values[0]
+    item = np.asarray(item, dtype=float).ravel()
+    if item.size != 1 or not np.isfinite(item[0]) or item[0] <= 0:
+        raise ValueError(f"Invalid {name} for patient {patient_index + 1}")
+    return float(item[0])
+
+
+def clean_labels(value):
+    array = np.asarray(value)
+    if array.dtype.kind in "ui" and array.size and np.nanmax(array) <= 65535:
+        text = "".join(chr(int(x)) for x in array.ravel(order="F") if int(x))
+    else:
+        text = "".join(str(x) for x in array.ravel(order="F"))
+    labels = np.array([c.upper() for c in text if c.upper() in ("N", "A")])
+    if labels.size == 0:
+        raise ValueError("No N/A annotations found")
+    return (labels == "A").astype(np.uint8)
+
+
+def centred_slope(series, window):
+    t = pd.Series(np.arange(len(series), dtype=float))
+    y = pd.Series(series, dtype=float)
+    roll = y.rolling(window, center=True, min_periods=max(3, window // 4))
+    mt = t.rolling(window, center=True, min_periods=max(3, window // 4)).mean()
+    numerator = (t * y).rolling(window, center=True,
+                                min_periods=max(3, window // 4)).mean() - mt * roll.mean()
+    denominator = (t * t).rolling(window, center=True,
+                                  min_periods=max(3, window // 4)).mean() - mt * mt
+    return (numerator / denominator).to_numpy()
+
+
+def extract_ecg_features(qrs, sample_rate, n_seconds):
+    qrs = np.asarray(qrs, dtype=float).ravel()
+    qrs = qrs[np.isfinite(qrs)]
+    # MATLAB QRS indices are one-based. The constant offset has no effect on RR.
+    qrs_seconds = (qrs - 1.0) / sample_rate
+    rr = np.diff(qrs_seconds)
+    rr[(rr < 0.30) | (rr > 2.00)] = np.nan
+    rr_time = (qrs_seconds[:-1] + qrs_seconds[1:]) / 2.0
+    second = np.floor(rr_time).astype(int)
+    valid_second = (second >= 0) & (second < n_seconds)
+
+    sums = np.bincount(second[valid_second & np.isfinite(rr)],
+                       weights=rr[valid_second & np.isfinite(rr)], minlength=n_seconds)
+    counts = np.bincount(second[valid_second & np.isfinite(rr)], minlength=n_seconds)
+    current_rr = np.divide(sums, counts, out=np.full(n_seconds, np.nan), where=counts > 0)
+    current_rr = pd.Series(current_rr).interpolate(limit=2, limit_direction="both").to_numpy()
+    rr_series = pd.Series(current_rr)
+    window = 41  # approximately +/-20 seconds
+    rolling = rr_series.rolling(window, center=True, min_periods=5)
+    rr_diff = rr_series.diff()
+    beat_seconds = np.floor(qrs_seconds).astype(int)
+    beat_seconds = beat_seconds[(beat_seconds >= 0) & (beat_seconds < n_seconds)]
+    beat_count = pd.Series(np.bincount(beat_seconds, minlength=n_seconds)).rolling(
+        window, center=True, min_periods=1).sum().to_numpy()
+
+    features = np.column_stack([
+        current_rr, 60.0 / current_rr, rolling.mean(), rolling.std(),
+        np.sqrt(rr_diff.pow(2).rolling(window, center=True, min_periods=4).mean()),
+        (rr_diff.abs() > 0.05).astype(float).rolling(window, center=True,
+                                                     min_periods=4).mean(),
+        rolling.min(), rolling.max(), beat_count, centred_slope(current_rr, window),
+    ])
+    names = ["ecg_rr_current", "ecg_hr_current", "ecg_rr_mean_41s",
+             "ecg_rr_std_41s", "ecg_rmssd_41s", "ecg_pnn50_41s",
+             "ecg_rr_min_41s", "ecg_rr_max_41s", "ecg_beat_count_41s",
+             "ecg_rr_slope_41s"]
+    return features, names
+
+
+def prepare_spo2(spo2, sample_rate, n_seconds):
+    values = np.asarray(spo2, dtype=float).ravel()
+    values[(values <= 0) | (values > 100)] = np.nan
+    source_t = (np.arange(values.size) + 0.5) / sample_rate
+    target_t = np.arange(n_seconds) + 0.5
+    valid = np.isfinite(values)
+    if valid.sum() < 2:
+        return np.full(n_seconds, np.nan)
+    result = np.interp(target_t, source_t[valid], values[valid], left=np.nan, right=np.nan)
+    result = pd.Series(result).interpolate(limit=10, limit_direction="both").to_numpy()
+    finite = np.isfinite(result)
+    if finite.any():
+        filled = pd.Series(result).ffill().bfill().to_numpy()
+        filtered = median_filter(filled, size=3, mode="nearest")
+        result[finite] = filtered[finite]
+    return result
+
+
+def extract_spo2_features(spo2, sample_rate, n_seconds):
+    values = prepare_spo2(spo2, sample_rate, n_seconds)
+    s = pd.Series(values)
+    columns, names = [values], ["spo2_current"]
+    rolls = {}
+    for window in (21, 61):
+        roll = s.rolling(window, center=True, min_periods=max(3, window // 4))
+        stats = {"mean": roll.mean(), "median": roll.median(), "std": roll.std(),
+                 "min": roll.min(), "max": roll.max()}
+        rolls[window] = stats
+        for name in ("mean", "median", "std", "min", "max"):
+            columns.append(stats[name].to_numpy())
+            names.append(f"spo2_{name}_{window}s")
+        columns.append((stats["max"] - stats["min"]).to_numpy())
+        names.append(f"spo2_range_{window}s")
+    for lag in (5, 10, 20):
+        columns.extend([(s - s.shift(lag)).to_numpy(), (s.shift(-lag) - s).to_numpy()])
+        names.extend([f"spo2_change_from_{lag}s_ago", f"spo2_change_to_{lag}s_ahead"])
+    columns.extend([(rolls[21]["max"] - s).to_numpy(),
+                    (rolls[61]["median"] - s).to_numpy(),
+                    (s.shift(-1).rolling(20, min_periods=3).min().shift(-19) - s).to_numpy(),
+                    centred_slope(values, 21), centred_slope(values, 61)])
+    names.extend(["spo2_drop_from_local_max", "spo2_drop_from_60s_median",
+                  "spo2_future_20s_min_minus_current", "spo2_slope_21s", "spo2_slope_61s"])
+    for threshold in (90, 92, 95):
+        columns.append((s < threshold).astype(float).rolling(61, center=True,
+                                                             min_periods=15).mean().to_numpy())
+        names.append(f"spo2_fraction_below_{threshold}_61s")
+    return np.column_stack(columns), names
+
+
+def extract_patient_features(data, patient_index):
+    y = clean_labels(data["Class"][patient_index])
+    n = y.size
+    ecg_rate = scalar_rate(data["SR_ECG"], patient_index, "SR_ECG")
+    spo2_rate = scalar_rate(data["SR_SpO2"], patient_index, "SR_SpO2")
+    ecg_x, ecg_names = extract_ecg_features(data["QRS"][patient_index], ecg_rate, n)
+    spo2_x, spo2_names = extract_spo2_features(data["SpO2"][patient_index], spo2_rate, n)
+    x = np.column_stack((ecg_x, spo2_x)).astype(np.float32)
+    assert x.shape[0] == y.size == n, "Feature extraction changed annotation length"
+    return x, y, ecg_names + spo2_names
+
+
+def build_feature_cache(data_path, selected_patients, cache_path):
+    data = load_training_data(data_path)
+    n_patients = len(data["Class"])
+    if selected_patients is None:
+        selected_patients = np.arange(1, n_patients + 1)
+    if selected_patients.max() > n_patients:
+        raise ValueError(f"Requested patient {selected_patients.max()}, but MAT has {n_patients}")
+    all_x, all_y, all_ids, feature_names = [], [], [], None
+    for patient_id in tqdm(selected_patients, desc="Extracting patient features"):
+        x, y, names = extract_patient_features(data, patient_id - 1)
+        if feature_names is not None:
+            assert names == feature_names
+        feature_names = names
+        all_x.append(x)
+        all_y.append(y)
+        all_ids.append(np.full(y.size, patient_id, dtype=np.int16))
+    x, y, patient_id = np.concatenate(all_x), np.concatenate(all_y), np.concatenate(all_ids)
+    assert x.shape[0] == y.size == patient_id.size
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, X=x, y=y, patient_id=patient_id,
+                        feature_names=np.asarray(feature_names), selected_patients=selected_patients)
+    return x, y, patient_id, np.asarray(feature_names)
+
+
+def load_or_build_cache(args, selected_patients, cache_path):
+    if cache_path.exists() and not args.rebuild_cache:
+        cached = np.load(cache_path, allow_pickle=False)
+        cached_patients = cached["selected_patients"]
+        is_all_cache = np.array_equal(cached_patients,
+                                      np.arange(1, cached_patients.max() + 1))
+        selection_matches = (args.patients == "all" and is_all_cache) or (
+            args.patients == "dev20" and np.array_equal(cached_patients, DEV20))
+        if selection_matches:
+            print(f"Loading feature cache: {cache_path}")
+            return cached["X"], cached["y"], cached["patient_id"], cached["feature_names"]
+        print("Cache patient selection differs; rebuilding it.")
+    if not args.data:
+        raise SystemExit("--data is required when a matching feature cache does not exist")
+    return build_feature_cache(Path(args.data), selected_patients, cache_path)
+
+
+def metrics(y, probability, threshold=0.5):
+    prediction = probability >= threshold
+    return np.array([recall_score(y, prediction, zero_division=0),
+                     precision_score(y, prediction, zero_division=0),
+                     f1_score(y, prediction, zero_division=0),
+                     accuracy_score(y, prediction)])
+
+
+def make_model(device, weight):
+    return XGBClassifier(objective="binary:logistic", n_estimators=600,
+                         learning_rate=0.05, max_depth=6, min_child_weight=5,
+                         subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+                         tree_method="hist", device=device, random_state=42,
+                         scale_pos_weight=weight, n_jobs=-1)
+
+
+def choose_device(requested):
+    if requested == "cpu":
+        return "cpu"
+    try:
+        subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        print("CUDA requested, but no working NVIDIA GPU was detected; falling back to CPU.")
+        return "cpu"
+    print("CUDA requested and an NVIDIA GPU was detected.")
+    return "cuda"
+
+
+def fit_model(x, y, device, weight):
+    model = make_model(device, weight)
+    try:
+        model.fit(x, y)
+        return model, device
+    except Exception as error:
+        if device != "cuda":
+            raise
+        print(f"CUDA training failed ({error}); retrying this and later models on CPU.")
+        model = make_model("cpu", weight)
+        model.fit(x, y)
+        return model, "cpu"
+
+
+def run_cross_validation(x, y, patient_id, feature_names, device, results_dir):
+    assert x.shape[0] == y.size == patient_id.size
+    assert set(np.unique(y)).issubset({0, 1}) and 1 in y, "A must be positive class 1"
+    patients = np.unique(patient_id)
+    if patients.size < 5:
+        raise ValueError("Five-fold CV requires at least five patients")
+    splitter = (StratifiedGroupKFold(5, shuffle=True, random_state=42)
+                if StratifiedGroupKFold else GroupKFold(5))
+    oof = np.full(y.size, np.nan, dtype=np.float32)
+    oof_count = np.zeros(y.size, dtype=np.uint8)
+    fold_metrics = []
+    for fold, (train, validation) in enumerate(splitter.split(x, y, patient_id), 1):
+        train_patients, validation_patients = np.unique(patient_id[train]), np.unique(patient_id[validation])
+        assert np.intersect1d(train_patients, validation_patients).size == 0
+        negative, positive = np.bincount(y[train], minlength=2)
+        if positive == 0:
+            raise ValueError(f"Fold {fold} training data has no A labels")
+        weight = float(np.sqrt(negative / positive))
+        print(f"\nFold {fold}\n  train patients: {train_patients.tolist()}"
+              f"\n  validation patients: {validation_patients.tolist()}"
+              f"\n  scale_pos_weight: {weight:.4f}")
+        model, device = fit_model(x[train], y[train], device, weight)
+        oof[validation] = model.predict_proba(x[validation])[:, 1]
+        oof_count[validation] += 1
+        scores = metrics(y[validation], oof[validation])
+        fold_metrics.append(scores)
+        print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*scores))
+    assert np.all(oof_count == 1) and np.isfinite(oof).all(), \
+        "Every annotated second must have exactly one OOF prediction"
+    fold_metrics = np.asarray(fold_metrics)
+    print("\nMean fold metrics at threshold 0.50")
+    print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*fold_metrics.mean(0)))
+    print(f"  Std fold F1={fold_metrics[:, 2].std():.4f}")
+    pooled = metrics(y, oof)
+    print("Pooled OOF at threshold 0.50")
+    print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*pooled))
+    thresholds = np.arange(0.10, 0.901, 0.01)
+    swept = np.asarray([metrics(y, oof, threshold) for threshold in thresholds])
+    best = int(np.argmax(swept[:, 2]))
+    print("OOF threshold-tuning diagnostic (NOT an independent test result)")
+    print("  threshold={:.2f}  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}"
+          .format(thresholds[best], *swept[best]))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(results_dir / "oof_predictions.npz", probability_a=oof,
+                        y_true=y, patient_id=patient_id, threshold_0_50=np.float32(0.5),
+                        best_oof_threshold=np.float32(thresholds[best]))
+
+    negative, positive = np.bincount(y, minlength=2)
+    final_model, _ = fit_model(x, y, device, float(np.sqrt(negative / positive)))
+    importance = pd.DataFrame({"feature": feature_names,
+                               "importance": final_model.feature_importances_})
+    importance = importance.sort_values("importance", ascending=False)
+    importance.to_csv(results_dir / "feature_importance.csv", index=False)
+    final_model.save_model(str(results_dir / "xgboost_model.json"))
+    print("\nTop 20 feature importances")
+    print(importance.head(20).to_string(index=False))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", help="Path to ProjectTrainData.mat")
+    parser.add_argument("--patients", choices=("dev20", "all"), default="dev20")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--rebuild-cache", action="store_true")
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent
+    selected = DEV20 if args.patients == "dev20" else None
+    cache_path = root / "cache" / "train_features.npz"
+    x, y, patient_id, feature_names = load_or_build_cache(args, selected, cache_path)
+    print(f"\nPatients: {np.unique(patient_id).size}\nSeconds: {y.size:,}"
+          f"\nA labels: {(y == 1).sum():,}\nN labels: {(y == 0).sum():,}"
+          f"\nFeatures: {x.shape[1]}\nFeature matrix RAM: {x.nbytes / 2**30:.2f} GiB")
+    run_cross_validation(x, y, patient_id, feature_names,
+                         choose_device(args.device), root / "results")
+
+
+if __name__ == "__main__":
+    main()
