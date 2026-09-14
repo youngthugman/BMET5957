@@ -11,7 +11,7 @@ import pandas as pd
 from scipy.io import loadmat
 from scipy.ndimage import median_filter
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, LeaveOneGroupOut
 from tqdm import tqdm
 from xgboost import XGBClassifier
 
@@ -285,39 +285,91 @@ def fit_model(x, y, device, weight):
         return model, "cpu"
 
 
-def run_cross_validation(x, y, patient_id, feature_names, device, results_dir):
+def patient_performance(y, probability, patient_id, best_threshold):
+    """Summarise OOF performance separately for every selected patient."""
+    rows = []
+    for patient in np.unique(patient_id):
+        selected = patient_id == patient
+        patient_y = y[selected]
+        patient_probability = probability[selected]
+        scores_050 = metrics(patient_y, patient_probability)
+        scores_best = metrics(patient_y, patient_probability, best_threshold)
+        a_seconds = int(patient_y.sum())
+        rows.append({
+            "patient_id": int(patient),
+            "seconds": int(selected.sum()),
+            "A_seconds": a_seconds,
+            "N_seconds": int(selected.sum() - a_seconds),
+            "A_prevalence": float(patient_y.mean()),
+            "sensitivity_050": scores_050[0],
+            "ppv_050": scores_050[1],
+            "f1_050": scores_050[2],
+            "accuracy_050": scores_050[3],
+            "mean_probability_A": float(patient_probability.mean()),
+            "sensitivity_best_threshold": scores_best[0],
+            "ppv_best_threshold": scores_best[1],
+            "f1_best_threshold": scores_best[2],
+            "accuracy_best_threshold": scores_best[3],
+        })
+    return pd.DataFrame(rows)
+
+
+def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
+                         cv_mode="5fold"):
     assert x.shape[0] == y.size == patient_id.size
     assert set(np.unique(y)).issubset({0, 1}) and 1 in y, "A must be positive class 1"
     patients = np.unique(patient_id)
-    if patients.size < 5:
+    if cv_mode == "5fold" and patients.size < 5:
         raise ValueError("Five-fold CV requires at least five patients")
-    splitter = (StratifiedGroupKFold(5, shuffle=True, random_state=42)
-                if StratifiedGroupKFold else GroupKFold(5))
+    if cv_mode == "logo":
+        if patients.size < 2:
+            raise ValueError("LOPO CV requires at least two patients")
+        splitter = LeaveOneGroupOut()
+    else:
+        splitter = (StratifiedGroupKFold(5, shuffle=True, random_state=42)
+                    if StratifiedGroupKFold else GroupKFold(5))
     oof = np.full(y.size, np.nan, dtype=np.float32)
     oof_count = np.zeros(y.size, dtype=np.uint8)
     fold_metrics = []
-    for fold, (train, validation) in enumerate(splitter.split(x, y, patient_id), 1):
+    splits = splitter.split(x, y, patient_id)
+    total_splits = patients.size if cv_mode == "logo" else 5
+    no_patient_overlap = True
+    for fold, (train, validation) in enumerate(splits, 1):
         train_patients, validation_patients = np.unique(patient_id[train]), np.unique(patient_id[validation])
-        assert np.intersect1d(train_patients, validation_patients).size == 0
+        overlap = np.intersect1d(train_patients, validation_patients).size > 0
+        no_patient_overlap = no_patient_overlap and not overlap
+        assert not overlap, "Training and validation patients must not overlap"
         negative, positive = np.bincount(y[train], minlength=2)
         if positive == 0:
             raise ValueError(f"Fold {fold} training data has no A labels")
         weight = float(np.sqrt(negative / positive))
-        print(f"\nFold {fold}\n  train patients: {train_patients.tolist()}"
-              f"\n  validation patients: {validation_patients.tolist()}"
-              f"\n  scale_pos_weight: {weight:.4f}")
+        if cv_mode == "logo":
+            print(f"\nLOPO {fold}/{total_splits}"
+                  f"\n  held-out patient: {validation_patients[0]}"
+                  f"\n  training patients: {train_patients.size}"
+                  f"\n  training seconds: {train.size:,}"
+                  f"\n  validation seconds: {validation.size:,}"
+                  f"\n  scale_pos_weight: {weight:.4f}"
+                  f"\n  A seconds: {(y[validation] == 1).sum():,}"
+                  f"\n  N seconds: {(y[validation] == 0).sum():,}")
+        else:
+            print(f"\nFold {fold}\n  train patients: {train_patients.tolist()}"
+                  f"\n  validation patients: {validation_patients.tolist()}"
+                  f"\n  scale_pos_weight: {weight:.4f}")
         model, device = fit_model(x[train], y[train], device, weight)
         oof[validation] = model.predict_proba(x[validation])[:, 1]
         oof_count[validation] += 1
         scores = metrics(y[validation], oof[validation])
         fold_metrics.append(scores)
         print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*scores))
+    assert no_patient_overlap, "Training and validation patients overlapped"
     assert np.all(oof_count == 1) and np.isfinite(oof).all(), \
         "Every annotated second must have exactly one OOF prediction"
     fold_metrics = np.asarray(fold_metrics)
-    print("\nMean fold metrics at threshold 0.50")
-    print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*fold_metrics.mean(0)))
-    print(f"  Std fold F1={fold_metrics[:, 2].std():.4f}")
+    if cv_mode == "5fold":
+        print("\nMean fold metrics at threshold 0.50")
+        print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*fold_metrics.mean(0)))
+        print(f"  Std fold F1={fold_metrics[:, 2].std():.4f}")
     pooled = metrics(y, oof)
     print("Pooled OOF at threshold 0.50")
     print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*pooled))
@@ -328,9 +380,32 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir):
     print("  threshold={:.2f}  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}"
           .format(thresholds[best], *swept[best]))
     results_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(results_dir / "oof_predictions.npz", probability_a=oof,
+    np.savez_compressed(results_dir / f"oof_predictions_{cv_mode}.npz", probability_a=oof,
                         y_true=y, patient_id=patient_id, threshold_0_50=np.float32(0.5),
                         best_oof_threshold=np.float32(thresholds[best]))
+    patient_results = patient_performance(y, oof, patient_id, thresholds[best])
+    patient_results.to_csv(results_dir / f"patient_performance_{cv_mode}.csv", index=False)
+
+    if cv_mode == "logo":
+        patient_scores = patient_results[["sensitivity_050", "ppv_050", "f1_050",
+                                           "accuracy_050"]]
+        means = patient_scores.mean()
+        print("\nPatient-level metrics at threshold 0.50")
+        print(f"  Mean patient Sensitivity={means['sensitivity_050']:.4f}"
+              f"\n  Mean patient PPV={means['ppv_050']:.4f}"
+              f"\n  Mean patient F1={means['f1_050']:.4f}"
+              f"\n  Mean patient Accuracy={means['accuracy_050']:.4f}"
+              f"\n  Std patient F1={patient_results['f1_050'].std(ddof=0):.4f}"
+              f"\n  Median patient F1={patient_results['f1_050'].median():.4f}"
+              f"\n  25th percentile patient F1={patient_results['f1_050'].quantile(.25):.4f}"
+              f"\n  75th percentile patient F1={patient_results['f1_050'].quantile(.75):.4f}")
+        rank_columns = ["patient_id", "A_seconds", "A_prevalence", "sensitivity_050",
+                        "ppv_050", "f1_050", "accuracy_050"]
+        rankable = patient_results[patient_results["A_seconds"] > 0]
+        print("\nBest 10 patients by F1 at threshold 0.50 (A_seconds > 0)")
+        print(rankable.nlargest(10, "f1_050")[rank_columns].to_string(index=False))
+        print("\nWorst 10 patients by F1 at threshold 0.50 (A_seconds > 0)")
+        print(rankable.nsmallest(10, "f1_050")[rank_columns].to_string(index=False))
 
     negative, positive = np.bincount(y, minlength=2)
     final_model, _ = fit_model(x, y, device, float(np.sqrt(negative / positive)))
@@ -348,6 +423,8 @@ def main():
     parser.add_argument("--data", help="Path to ProjectTrainData.mat")
     parser.add_argument("--patients", choices=("dev20", "all"), default="dev20")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--cv", choices=("5fold", "logo"), default="5fold",
+                        help="Patient-wise cross-validation method")
     parser.add_argument("--rebuild-cache", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
@@ -358,7 +435,7 @@ def main():
           f"\nA labels: {(y == 1).sum():,}\nN labels: {(y == 0).sum():,}"
           f"\nFeatures: {x.shape[1]}\nFeature matrix RAM: {x.nbytes / 2**30:.2f} GiB")
     run_cross_validation(x, y, patient_id, feature_names,
-                         choose_device(args.device), root / "results")
+                         choose_device(args.device), root / "results", args.cv)
 
 
 if __name__ == "__main__":
