@@ -2,6 +2,7 @@
 """Small patient-wise XGBoost benchmark for ProjectTrainData.mat."""
 
 import argparse
+import importlib.util
 import subprocess
 from pathlib import Path
 
@@ -23,7 +24,28 @@ except ImportError:  # scikit-learn before 1.1
 
 DEV20 = np.array([1, 3, 9, 12, 15, 17, 18, 30, 33, 36, 37, 38,
                   42, 47, 50, 57, 61, 72, 77, 94])
-FIELDS = ("ECG", "SpO2", "Class", "QRS", "SR_ECG", "SR_SpO2")
+FIELDS = ("ECG", "SpO2", "Class", "SR_ECG", "SR_SpO2")
+ECG_EXTRACTOR_VERSION = "submission2-group5-causal-qrs-v1"
+
+
+def _load_qrs_detector():
+    """Load the submitted Group 5 detector from its original source file."""
+    detector_path = (Path(__file__).resolve().parents[1]
+                     / "Submission2_Group5_FINAL" / "Submission2_Group5_FINAL"
+                     / "reference-data" / "Anthony-V2" / "Code"
+                     / "qrs_detector_causal.py")
+    if not detector_path.is_file():
+        raise ImportError(f"Group 5 QRS detector not found: {detector_path}")
+    spec = importlib.util.spec_from_file_location("submission2_group5_qrs_detector",
+                                                  detector_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load Group 5 QRS detector: {detector_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.detect_qrs_causal
+
+
+detect_qrs_causal = _load_qrs_detector()
 
 
 def _scipy_cells(value):
@@ -140,6 +162,19 @@ def extract_ecg_features(qrs, sample_rate, n_seconds):
     return features, names
 
 
+def detect_qrs(ecg, sample_rate):
+    """Run the submitted QRS detector and return zero-based sample indices."""
+    rate = int(round(sample_rate))
+    if not np.isclose(sample_rate, rate):
+        raise ValueError("The Group 5 QRS detector requires an integer ECG sample rate")
+    signal = np.asarray(ecg, dtype=float).ravel()
+    if signal.size < 3 * rate:
+        raise ValueError("ECG recording is too short for the Group 5 QRS detector")
+    if not np.isfinite(signal).all():
+        raise ValueError("ECG contains non-finite samples")
+    return detect_qrs_causal(signal, fs=rate)
+
+
 def prepare_spo2(spo2, sample_rate, n_seconds):
     values = np.asarray(spo2, dtype=float).ravel()
     values[(values <= 0) | (values > 100)] = np.nan
@@ -149,7 +184,8 @@ def prepare_spo2(spo2, sample_rate, n_seconds):
     if valid.sum() < 2:
         return np.full(n_seconds, np.nan)
     result = np.interp(target_t, source_t[valid], values[valid], left=np.nan, right=np.nan)
-    result = pd.Series(result).interpolate(limit=10, limit_direction="both").to_numpy()
+    result = pd.Series(result).interpolate(
+        limit=10, limit_direction="both").to_numpy(copy=True)
     finite = np.isfinite(result)
     if finite.any():
         filled = pd.Series(result).ffill().bfill().to_numpy()
@@ -194,7 +230,10 @@ def extract_patient_features(data, patient_index):
     n = y.size
     ecg_rate = scalar_rate(data["SR_ECG"], patient_index, "SR_ECG")
     spo2_rate = scalar_rate(data["SR_SpO2"], patient_index, "SR_SpO2")
-    ecg_x, ecg_names = extract_ecg_features(data["QRS"][patient_index], ecg_rate, n)
+    detected_qrs = detect_qrs(data["ECG"][patient_index], ecg_rate)
+    # extract_ecg_features accepts MATLAB-style one-based indices. Preserve that
+    # interface while supplying the detector's documented zero-based output.
+    ecg_x, ecg_names = extract_ecg_features(detected_qrs + 1, ecg_rate, n)
     spo2_x, spo2_names = extract_spo2_features(data["SpO2"][patient_index], spo2_rate, n)
     x = np.column_stack((ecg_x, spo2_x)).astype(np.float32)
     assert x.shape[0] == y.size == n, "Feature extraction changed annotation length"
@@ -221,22 +260,28 @@ def build_feature_cache(data_path, selected_patients, cache_path):
     assert x.shape[0] == y.size == patient_id.size
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(cache_path, X=x, y=y, patient_id=patient_id,
-                        feature_names=np.asarray(feature_names), selected_patients=selected_patients)
+                        feature_names=np.asarray(feature_names), selected_patients=selected_patients,
+                        ecg_extractor_version=np.asarray(ECG_EXTRACTOR_VERSION))
     return x, y, patient_id, np.asarray(feature_names)
 
 
 def load_or_build_cache(args, selected_patients, cache_path):
     if cache_path.exists() and not args.rebuild_cache:
         cached = np.load(cache_path, allow_pickle=False)
-        cached_patients = cached["selected_patients"]
-        is_all_cache = np.array_equal(cached_patients,
-                                      np.arange(1, cached_patients.max() + 1))
-        selection_matches = (args.patients == "all" and is_all_cache) or (
-            args.patients == "dev20" and np.array_equal(cached_patients, DEV20))
-        if selection_matches:
-            print(f"Loading feature cache: {cache_path}")
-            return cached["X"], cached["y"], cached["patient_id"], cached["feature_names"]
-        print("Cache patient selection differs; rebuilding it.")
+        cached_version = (str(cached["ecg_extractor_version"])
+                          if "ecg_extractor_version" in cached.files else None)
+        if cached_version != ECG_EXTRACTOR_VERSION:
+            print("Cache uses a different ECG extractor; rebuilding it.")
+        else:
+            cached_patients = cached["selected_patients"]
+            is_all_cache = np.array_equal(cached_patients,
+                                          np.arange(1, cached_patients.max() + 1))
+            selection_matches = (args.patients == "all" and is_all_cache) or (
+                args.patients == "dev20" and np.array_equal(cached_patients, DEV20))
+            if selection_matches:
+                print(f"Loading feature cache: {cache_path}")
+                return cached["X"], cached["y"], cached["patient_id"], cached["feature_names"]
+            print("Cache patient selection differs; rebuilding it.")
     if not args.data:
         raise SystemExit("--data is required when a matching feature cache does not exist")
     return build_feature_cache(Path(args.data), selected_patients, cache_path)
