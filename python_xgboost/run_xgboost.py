@@ -25,7 +25,7 @@ except ImportError:  # scikit-learn before 1.1
 DEV20 = np.array([1, 3, 9, 12, 15, 17, 18, 30, 33, 36, 37, 38,
                   42, 47, 50, 57, 61, 72, 77, 94])
 FIELDS = ("ECG", "SpO2", "Class", "SR_ECG", "SR_SpO2")
-ECG_EXTRACTOR_VERSION = "submission2-group5-causal-qrs-v1"
+ECG_EXTRACTOR_VERSION = "submission2-group5-qrs-multiscale-ecg-v2"
 
 
 def _load_qrs_detector():
@@ -123,6 +123,17 @@ def centred_slope(series, window):
     return (numerator / denominator).to_numpy()
 
 
+def causal_slope(series, window, min_periods):
+    """Rolling least-squares slope using only the current and preceding rows."""
+    t = pd.Series(np.arange(len(series), dtype=float))
+    y = pd.Series(series, dtype=float)
+    roll = y.rolling(window, min_periods=min_periods)
+    mt = t.rolling(window, min_periods=min_periods).mean()
+    numerator = (t * y).rolling(window, min_periods=min_periods).mean() - mt * roll.mean()
+    denominator = (t * t).rolling(window, min_periods=min_periods).mean() - mt * mt
+    return (numerator / denominator).to_numpy()
+
+
 def extract_ecg_features(qrs, sample_rate, n_seconds):
     qrs = np.asarray(qrs, dtype=float).ravel()
     qrs = qrs[np.isfinite(qrs)]
@@ -148,17 +159,91 @@ def extract_ecg_features(qrs, sample_rate, n_seconds):
     beat_count = pd.Series(np.bincount(beat_seconds, minlength=n_seconds)).rolling(
         window, center=True, min_periods=1).sum().to_numpy()
 
-    features = np.column_stack([
+    # Keep these original ten columns byte-for-byte equivalent to the baseline.
+    baseline_columns = [
         current_rr, 60.0 / current_rr, rolling.mean(), rolling.std(),
         np.sqrt(rr_diff.pow(2).rolling(window, center=True, min_periods=4).mean()),
         (rr_diff.abs() > 0.05).astype(float).rolling(window, center=True,
                                                      min_periods=4).mean(),
         rolling.min(), rolling.max(), beat_count, centred_slope(current_rr, window),
-    ])
+    ]
     names = ["ecg_rr_current", "ecg_hr_current", "ecg_rr_mean_41s",
              "ecg_rr_std_41s", "ecg_rmssd_41s", "ecg_pnn50_41s",
              "ecg_rr_min_41s", "ecg_rr_max_41s", "ecg_beat_count_41s",
              "ecg_rr_slope_41s"]
+    columns = list(baseline_columns)
+
+    # All columns below are causal: pandas' default rolling alignment ends at t,
+    # and positive shifts refer only to an earlier second.
+    hr_series = pd.Series(60.0 / current_rr)
+    for signal_name, series in (("rr", rr_series), ("hr", hr_series)):
+        for lag in (5, 10, 20):
+            columns.append((series - series.shift(lag)).to_numpy())
+            names.append(f"ecg_{signal_name}_change_{lag}s")
+
+    rr_means = {}
+    hr_means = {}
+    for short_window in (5, 10, 20):
+        min_periods = max(2, short_window // 4)
+        rr_roll = rr_series.rolling(short_window, min_periods=min_periods)
+        rr_stats = {
+            "mean": rr_roll.mean(), "std": rr_roll.std(),
+            "min": rr_roll.min(), "max": rr_roll.max(),
+        }
+        rr_stats["range"] = rr_stats["max"] - rr_stats["min"]
+        rr_means[short_window] = rr_stats["mean"]
+        for statistic in ("mean", "std", "min", "max", "range"):
+            columns.append(rr_stats[statistic].to_numpy())
+            names.append(f"ecg_rr_{statistic}_{short_window}s")
+        columns.append(causal_slope(current_rr, short_window, min_periods))
+        names.append(f"ecg_rr_slope_{short_window}s")
+
+        hr_roll = hr_series.rolling(short_window, min_periods=min_periods)
+        hr_stats = {
+            "mean": hr_roll.mean(), "std": hr_roll.std(),
+            "min": hr_roll.min(), "max": hr_roll.max(),
+        }
+        hr_stats["range"] = hr_stats["max"] - hr_stats["min"]
+        hr_means[short_window] = hr_stats["mean"]
+        for statistic in ("mean", "std", "min", "max", "range"):
+            columns.append(hr_stats[statistic].to_numpy())
+            names.append(f"ecg_hr_{statistic}_{short_window}s")
+
+    for hrv_window in (10, 20):
+        min_periods = max(2, hrv_window // 4)
+        diff_roll = rr_diff.rolling(hrv_window, min_periods=min_periods)
+        columns.extend([
+            np.sqrt(diff_roll.apply(lambda values: np.mean(values ** 2), raw=True)).to_numpy(),
+            rr_diff.abs().gt(0.05).rolling(
+                hrv_window, min_periods=min_periods).mean().to_numpy(),
+        ])
+        names.extend([f"ecg_rmssd_{hrv_window}s", f"ecg_pnn50_{hrv_window}s"])
+
+    # The new long baselines are deliberately causal, unlike the retained
+    # centred 41-second baseline features above.
+    rr_mean_41s_causal = rr_series.rolling(41, min_periods=5).mean()
+    hr_mean_41s_causal = hr_series.rolling(41, min_periods=5).mean()
+    columns.extend([(rr_series - rr_mean_41s_causal).to_numpy(),
+                    (hr_series - hr_mean_41s_causal).to_numpy()])
+    names.extend(["ecg_rr_vs_41s_mean", "ecg_hr_vs_41s_mean"])
+    for short_window in (5, 10, 20):
+        columns.extend([(rr_means[short_window] - rr_mean_41s_causal).to_numpy(),
+                        (hr_means[short_window] - hr_mean_41s_causal).to_numpy()])
+        names.extend([f"ecg_rr_mean_{short_window}s_minus_41s",
+                      f"ecg_hr_mean_{short_window}s_minus_41s"])
+
+    rr_delta = rr_series.diff()
+    hr_delta = hr_series.diff()
+    columns.extend([hr_delta.to_numpy(), rr_delta.to_numpy(),
+                    hr_delta.rolling(5, min_periods=2).std().to_numpy(),
+                    rr_delta.rolling(5, min_periods=2).std().to_numpy()])
+    names.extend(["ecg_hr_delta_1s", "ecg_rr_delta_1s",
+                  "ecg_hr_delta_std_5s", "ecg_rr_delta_std_5s"])
+
+    features = np.column_stack(columns)
+    assert features.shape[0] == n_seconds
+    assert features.shape[1] == len(names)
+    assert len(names) == len(set(names)) and all(name.startswith("ecg_") for name in names)
     return features, names
 
 
@@ -470,7 +555,7 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
             "patient_results": patient_results}
 
 
-def print_ablation_comparison(results, results_dir):
+def print_ablation_comparison(results, results_dir, cv_mode):
     """Save and display pooled and patient-level feature-ablation comparisons."""
     labels = {"ecg": "ECG only", "spo2": "SpO2 only", "all": "All"}
     summary_rows = []
@@ -488,7 +573,7 @@ def print_ablation_comparison(results, results_dir):
             "patient_f1_75th_percentile": patient_f1.quantile(.75),
         })
     summary = pd.DataFrame(summary_rows)
-    summary.to_csv(results_dir / "feature_ablation_summary.csv", index=False)
+    summary.to_csv(results_dir / f"feature_ablation_summary_{cv_mode}.csv", index=False)
     print("\nFeature ablation comparison at threshold 0.50")
     display_columns = ["feature_set", "features", "sensitivity", "ppv", "pooled_f1",
                        "accuracy", "median_patient_f1"]
@@ -509,7 +594,8 @@ def print_ablation_comparison(results, results_dir):
     comparison["all_minus_spo2_f1"] = comparison["f1_all"] - comparison["f1_spo2"]
     comparison["all_minus_ecg_f1"] = comparison["f1_all"] - comparison["f1_ecg"]
     comparison = comparison.reset_index()
-    comparison.to_csv(results_dir / "feature_ablation_patient_comparison.csv", index=False)
+    comparison.to_csv(
+        results_dir / f"feature_ablation_patient_comparison_{cv_mode}.csv", index=False)
     print("\n10 patients where adding ECG to SpO2 improves F1 the most")
     print(comparison.nlargest(10, "all_minus_spo2_f1").to_string(index=False))
     print("\n10 patients where adding ECG to SpO2 hurts F1 the most")
@@ -527,8 +613,6 @@ def main():
                         default="all", help="Feature set to evaluate")
     parser.add_argument("--rebuild-cache", action="store_true")
     args = parser.parse_args()
-    if args.features == "compare" and args.cv != "logo":
-        parser.error("--features compare requires --cv logo for LOPO feature ablation")
     root = Path(__file__).resolve().parent
     selected = DEV20 if args.patients == "dev20" else None
     cache_path = root / "cache" / "train_features.npz"
@@ -541,9 +625,19 @@ def main():
     }
     if not feature_masks["ecg"].any() or not feature_masks["spo2"].any():
         raise ValueError("Cached feature_names must contain both ecg_ and spo2_ features")
+    ecg_names = feature_names[feature_masks["ecg"]]
+    assert np.unique(ecg_names).size == ecg_names.size
+    assert np.all(np.char.startswith(ecg_names, "ecg_"))
+    assert x.shape[0] == y.size == patient_id.size
+    assert x.shape[1] == feature_names.size
     print(f"\nPatients: {np.unique(patient_id).size}\nSeconds: {y.size:,}"
           f"\nA labels: {(y == 1).sum():,}\nN labels: {(y == 0).sum():,}"
-          f"\nFeatures: {x.shape[1]}\nFeature matrix RAM: {x.nbytes / 2**30:.2f} GiB")
+          f"\nECG features: {feature_masks['ecg'].sum()}"
+          f"\nSpO2 features: {feature_masks['spo2'].sum()}"
+          f"\nCombined features: {x.shape[1]}"
+          f"\nFeature matrix RAM: {x.nbytes / 2**30:.2f} GiB")
+    print("ECG feature names:")
+    print("  " + "\n  ".join(ecg_names))
     labels = {"ecg": "ECG only", "spo2": "SpO2 only", "all": "All"}
     requested_sets = ("ecg", "spo2", "all") if args.features == "compare" else (args.features,)
     device = choose_device(args.device)
@@ -555,7 +649,7 @@ def main():
             x[:, mask], y, patient_id, feature_names[mask], device, root / "results",
             args.cv, feature_set, train_final_model=args.features != "compare"))
     if args.features == "compare":
-        print_ablation_comparison(results, root / "results")
+        print_ablation_comparison(results, root / "results", args.cv)
 
 
 if __name__ == "__main__":

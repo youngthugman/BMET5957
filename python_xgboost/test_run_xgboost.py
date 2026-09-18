@@ -12,6 +12,32 @@ from python_xgboost import run_xgboost
 
 
 class ECGFeatureExtractionTests(unittest.TestCase):
+    def test_multiscale_features_are_complete_unique_and_causal(self):
+        # One valid RR observation per second, with enough history for every window.
+        rr = 0.75 + 0.04 * np.sin(np.arange(80) / 5)
+        qrs_seconds = np.concatenate(([0.1], 0.1 + np.cumsum(rr)))
+        qrs = qrs_seconds * 100 + 1
+        features, names = run_xgboost.extract_ecg_features(qrs, 100, 80)
+
+        self.assertEqual(features.shape, (80, 65))
+        self.assertEqual(len(names), 65)
+        self.assertEqual(len(set(names)), len(names))
+        self.assertTrue(all(name.startswith("ecg_") for name in names))
+        self.assertEqual(names[:10], [
+            "ecg_rr_current", "ecg_hr_current", "ecg_rr_mean_41s",
+            "ecg_rr_std_41s", "ecg_rmssd_41s", "ecg_pnn50_41s",
+            "ecg_rr_min_41s", "ecg_rr_max_41s", "ecg_beat_count_41s",
+            "ecg_rr_slope_41s",
+        ])
+
+        # Appending future beats cannot alter any new feature at an earlier time.
+        extended_rr = np.concatenate((rr, np.full(20, 1.5)))
+        extended_qrs = np.concatenate(([0.1], 0.1 + np.cumsum(extended_rr))) * 100 + 1
+        extended, extended_names = run_xgboost.extract_ecg_features(
+            extended_qrs, 100, 100)
+        self.assertEqual(names, extended_names)
+        np.testing.assert_allclose(features[:50, 10:], extended[:50, 10:], equal_nan=True)
+
     def test_patient_features_detect_qrs_from_raw_ecg(self):
         data = {
             "ECG": [np.arange(500, dtype=float)],
