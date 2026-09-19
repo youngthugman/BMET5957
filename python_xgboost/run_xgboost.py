@@ -3,6 +3,7 @@
 
 import argparse
 import importlib.util
+import itertools
 import subprocess
 from pathlib import Path
 
@@ -26,6 +27,11 @@ DEV20 = np.array([1, 3, 9, 12, 15, 17, 18, 30, 33, 36, 37, 38,
                   42, 47, 50, 57, 61, 72, 77, 94])
 FIELDS = ("ECG", "SpO2", "Class", "SR_ECG", "SR_SpO2")
 ECG_EXTRACTOR_VERSION = "submission2-group5-qrs-multiscale-ecg-v2"
+SPO2_EXTRACTOR_VERSION = "rolling-windows-v1"
+SPO2_WINDOWS = {"baseline": (21, 61), "extended": (21, 41, 61, 91)}
+SMOOTHING_WINDOWS = (1, 3, 5, 7, 10)
+THRESHOLDS = np.round(np.arange(0.10, 0.901, 0.01), 2)
+assert 0.50 in THRESHOLDS and 0.75 in THRESHOLDS
 
 
 def _load_qrs_detector():
@@ -279,12 +285,12 @@ def prepare_spo2(spo2, sample_rate, n_seconds):
     return result
 
 
-def extract_spo2_features(spo2, sample_rate, n_seconds):
+def extract_spo2_features(spo2, sample_rate, n_seconds, windows=(21, 61)):
     values = prepare_spo2(spo2, sample_rate, n_seconds)
     s = pd.Series(values)
     columns, names = [values], ["spo2_current"]
     rolls = {}
-    for window in (21, 61):
+    for window in windows:
         roll = s.rolling(window, center=True, min_periods=max(3, window // 4))
         stats = {"mean": roll.mean(), "median": roll.median(), "std": roll.std(),
                  "min": roll.min(), "max": roll.max()}
@@ -299,18 +305,23 @@ def extract_spo2_features(spo2, sample_rate, n_seconds):
         names.extend([f"spo2_change_from_{lag}s_ago", f"spo2_change_to_{lag}s_ahead"])
     columns.extend([(rolls[21]["max"] - s).to_numpy(),
                     (rolls[61]["median"] - s).to_numpy(),
-                    (s.shift(-1).rolling(20, min_periods=3).min().shift(-19) - s).to_numpy(),
-                    centred_slope(values, 21), centred_slope(values, 61)])
+                    (s.shift(-1).rolling(20, min_periods=3).min().shift(-19) - s).to_numpy()])
     names.extend(["spo2_drop_from_local_max", "spo2_drop_from_60s_median",
-                  "spo2_future_20s_min_minus_current", "spo2_slope_21s", "spo2_slope_61s"])
+                  "spo2_future_20s_min_minus_current"])
+    for window in windows:
+        columns.append(centred_slope(values, window))
+        names.append(f"spo2_slope_{window}s")
     for threshold in (90, 92, 95):
         columns.append((s < threshold).astype(float).rolling(61, center=True,
                                                              min_periods=15).mean().to_numpy())
         names.append(f"spo2_fraction_below_{threshold}_61s")
-    return np.column_stack(columns), names
+    features = np.column_stack(columns)
+    assert features.shape[1] == len(names)
+    assert len(names) == len(set(names)) and all(name.startswith("spo2_") for name in names)
+    return features, names
 
 
-def extract_patient_features(data, patient_index):
+def extract_patient_features(data, patient_index, spo2_windows=(21, 61)):
     y = clean_labels(data["Class"][patient_index])
     n = y.size
     ecg_rate = scalar_rate(data["SR_ECG"], patient_index, "SR_ECG")
@@ -319,13 +330,14 @@ def extract_patient_features(data, patient_index):
     # extract_ecg_features accepts MATLAB-style one-based indices. Preserve that
     # interface while supplying the detector's documented zero-based output.
     ecg_x, ecg_names = extract_ecg_features(detected_qrs + 1, ecg_rate, n)
-    spo2_x, spo2_names = extract_spo2_features(data["SpO2"][patient_index], spo2_rate, n)
+    spo2_x, spo2_names = extract_spo2_features(
+        data["SpO2"][patient_index], spo2_rate, n, spo2_windows)
     x = np.column_stack((ecg_x, spo2_x)).astype(np.float32)
     assert x.shape[0] == y.size == n, "Feature extraction changed annotation length"
     return x, y, ecg_names + spo2_names
 
 
-def build_feature_cache(data_path, selected_patients, cache_path):
+def build_feature_cache(data_path, selected_patients, cache_path, spo2_window_mode="baseline"):
     data = load_training_data(data_path)
     n_patients = len(data["Class"])
     if selected_patients is None:
@@ -334,7 +346,8 @@ def build_feature_cache(data_path, selected_patients, cache_path):
         raise ValueError(f"Requested patient {selected_patients.max()}, but MAT has {n_patients}")
     all_x, all_y, all_ids, feature_names = [], [], [], None
     for patient_id in tqdm(selected_patients, desc="Extracting patient features"):
-        x, y, names = extract_patient_features(data, patient_id - 1)
+        x, y, names = extract_patient_features(
+            data, patient_id - 1, SPO2_WINDOWS[spo2_window_mode])
         if feature_names is not None:
             assert names == feature_names
         feature_names = names
@@ -346,17 +359,28 @@ def build_feature_cache(data_path, selected_patients, cache_path):
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(cache_path, X=x, y=y, patient_id=patient_id,
                         feature_names=np.asarray(feature_names), selected_patients=selected_patients,
-                        ecg_extractor_version=np.asarray(ECG_EXTRACTOR_VERSION))
+                        ecg_extractor_version=np.asarray(ECG_EXTRACTOR_VERSION),
+                        spo2_extractor_version=np.asarray(SPO2_EXTRACTOR_VERSION),
+                        spo2_window_mode=np.asarray(spo2_window_mode))
     return x, y, patient_id, np.asarray(feature_names)
 
 
 def load_or_build_cache(args, selected_patients, cache_path):
+    requested_spo2_mode = getattr(args, "spo2_windows", "baseline")
     if cache_path.exists() and not args.rebuild_cache:
         cached = np.load(cache_path, allow_pickle=False)
         cached_version = (str(cached["ecg_extractor_version"])
                           if "ecg_extractor_version" in cached.files else None)
+        cached_spo2_version = (str(cached["spo2_extractor_version"])
+                               if "spo2_extractor_version" in cached.files else None)
+        cached_spo2_mode = (str(cached["spo2_window_mode"])
+                            if "spo2_window_mode" in cached.files else None)
         if cached_version != ECG_EXTRACTOR_VERSION:
             print("Cache uses a different ECG extractor; rebuilding it.")
+        elif (cached_spo2_version != SPO2_EXTRACTOR_VERSION or
+              cached_spo2_mode != requested_spo2_mode):
+            print("Cache SpO2 extractor/window configuration does not match "
+                  f"requested '{requested_spo2_mode}'; rebuilding it.")
         else:
             cached_patients = cached["selected_patients"]
             is_all_cache = np.array_equal(cached_patients,
@@ -369,7 +393,8 @@ def load_or_build_cache(args, selected_patients, cache_path):
             print("Cache patient selection differs; rebuilding it.")
     if not args.data:
         raise SystemExit("--data is required when a matching feature cache does not exist")
-    return build_feature_cache(Path(args.data), selected_patients, cache_path)
+    return build_feature_cache(Path(args.data), selected_patients, cache_path,
+                               requested_spo2_mode)
 
 
 def metrics(y, probability, threshold=0.5):
@@ -380,10 +405,13 @@ def metrics(y, probability, threshold=0.5):
                      accuracy_score(y, prediction)])
 
 
-def make_model(device, weight):
+def make_model(device, weight, model_params=None):
+    model_params = model_params or {}
     return XGBClassifier(objective="binary:logistic", n_estimators=600,
-                         learning_rate=0.05, max_depth=6, min_child_weight=5,
-                         subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+                         learning_rate=0.05, max_depth=model_params.get("max_depth", 6),
+                         min_child_weight=model_params.get("min_child_weight", 5),
+                         subsample=0.8, colsample_bytree=0.8,
+                         reg_lambda=model_params.get("reg_lambda", 1.0),
                          tree_method="hist", device=device, random_state=42,
                          scale_pos_weight=weight, n_jobs=-1)
 
@@ -401,8 +429,8 @@ def choose_device(requested):
     return "cuda"
 
 
-def fit_model(x, y, device, weight):
-    model = make_model(device, weight)
+def fit_model(x, y, device, weight, model_params=None):
+    model = make_model(device, weight, model_params)
     try:
         model.fit(x, y)
         return model, device
@@ -410,9 +438,74 @@ def fit_model(x, y, device, weight):
         if device != "cuda":
             raise
         print(f"CUDA training failed ({error}); retrying this and later models on CPU.")
-        model = make_model("cpu", weight)
+        model = make_model("cpu", weight, model_params)
         model.fit(x, y)
-        return model, "cpu"
+    return model, "cpu"
+
+
+def smooth_probabilities_by_patient(probability, patient_id, window):
+    """Return a causal rolling mean, independently within each patient."""
+    probability = np.asarray(probability)
+    patient_id = np.asarray(patient_id)
+    if probability.shape != patient_id.shape or window < 1:
+        raise ValueError("Probability/patient arrays must match and window must be positive")
+    if window == 1:
+        return probability.copy()
+    smoothed = np.empty(probability.size, dtype=float)
+    for patient in np.unique(patient_id):
+        selected = np.flatnonzero(patient_id == patient)
+        smoothed[selected] = pd.Series(probability[selected]).rolling(
+            window, min_periods=1).mean().to_numpy()
+    assert smoothed.size == probability.size
+    return smoothed
+
+
+def threshold_sweep(y, probability):
+    """Evaluate the fixed, inclusive diagnostic threshold grid."""
+    assert np.any(THRESHOLDS == 0.50) and np.any(THRESHOLDS == 0.75)
+    scores = np.asarray([metrics(y, probability, threshold) for threshold in THRESHOLDS])
+    return scores, int(np.argmax(scores[:, 2]))
+
+
+def smoothing_diagnostics(y, probability, patient_id):
+    """Evaluate causal smoothing at 0.50 and across the diagnostic threshold grid."""
+    summaries, sweep_rows = [], []
+    for window in SMOOTHING_WINDOWS:
+        smoothed = smooth_probabilities_by_patient(probability, patient_id, window)
+        if window == 1:
+            assert np.array_equal(smoothed, probability)
+        scores_050 = metrics(y, smoothed)
+        swept, best = threshold_sweep(y, smoothed)
+        for threshold, score in zip(THRESHOLDS, swept):
+            sweep_rows.append({"smoothing_window_seconds": window, "threshold": threshold,
+                               "sensitivity": score[0], "ppv": score[1],
+                               "f1": score[2], "accuracy": score[3]})
+        summaries.append({"window": window, "sens@0.50": scores_050[0],
+                          "ppv@0.50": scores_050[1], "f1@0.50": scores_050[2],
+                          "accuracy@0.50": scores_050[3],
+                          "best_threshold": THRESHOLDS[best],
+                          "best_sens": swept[best, 0], "best_ppv": swept[best, 1],
+                          "best_f1": swept[best, 2], "best_accuracy": swept[best, 3]})
+    summary = pd.DataFrame(summaries)
+    sweep = pd.DataFrame(sweep_rows)
+    best_row = summary.loc[summary["best_f1"].idxmax()]
+    return summary, sweep, best_row
+
+
+def materialise_splits(x, y, patient_id, cv_mode):
+    """Create reusable patient-independent folds."""
+    patients = np.unique(patient_id)
+    if cv_mode == "logo":
+        splitter = LeaveOneGroupOut()
+    else:
+        splitter = (StratifiedGroupKFold(5, shuffle=True, random_state=42)
+                    if StratifiedGroupKFold else GroupKFold(5))
+    splits = [(train.copy(), validation.copy())
+              for train, validation in splitter.split(x, y, patient_id)]
+    for train, validation in splits:
+        assert not np.intersect1d(patient_id[train], patient_id[validation]).size
+    assert len(splits) == (patients.size if cv_mode == "logo" else 5)
+    return splits
 
 
 def patient_performance(y, probability, patient_id, best_threshold):
@@ -445,23 +538,20 @@ def patient_performance(y, probability, patient_id, best_threshold):
 
 
 def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
-                         cv_mode="5fold", feature_set="all", train_final_model=True):
+                         cv_mode="5fold", feature_set="all", train_final_model=True,
+                         spo2_window_mode="baseline", model_params=None, splits=None,
+                         save_outputs=True):
     assert x.shape[0] == y.size == patient_id.size
     assert set(np.unique(y)).issubset({0, 1}) and 1 in y, "A must be positive class 1"
     patients = np.unique(patient_id)
     if cv_mode == "5fold" and patients.size < 5:
         raise ValueError("Five-fold CV requires at least five patients")
-    if cv_mode == "logo":
-        if patients.size < 2:
-            raise ValueError("LOPO CV requires at least two patients")
-        splitter = LeaveOneGroupOut()
-    else:
-        splitter = (StratifiedGroupKFold(5, shuffle=True, random_state=42)
-                    if StratifiedGroupKFold else GroupKFold(5))
+    if cv_mode == "logo" and patients.size < 2:
+        raise ValueError("LOPO CV requires at least two patients")
     oof = np.full(y.size, np.nan, dtype=np.float32)
     oof_count = np.zeros(y.size, dtype=np.uint8)
     fold_metrics = []
-    splits = splitter.split(x, y, patient_id)
+    splits = materialise_splits(x, y, patient_id, cv_mode) if splits is None else splits
     total_splits = patients.size if cv_mode == "logo" else 5
     no_patient_overlap = True
     for fold, (train, validation) in enumerate(splits, 1):
@@ -486,7 +576,9 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
             print(f"\nFold {fold}\n  train patients: {train_patients.tolist()}"
                   f"\n  validation patients: {validation_patients.tolist()}"
                   f"\n  scale_pos_weight: {weight:.4f}")
-        model, device = fit_model(x[train], y[train], device, weight)
+        # This weight is intentionally derived only from this fold's training rows.
+        assert negative + positive == train.size
+        model, device = fit_model(x[train], y[train], device, weight, model_params)
         oof[validation] = model.predict_proba(x[validation])[:, 1]
         oof_count[validation] += 1
         scores = metrics(y[validation], oof[validation])
@@ -504,20 +596,47 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
     evaluation_name = "LOPO" if cv_mode == "logo" else "OOF"
     print(f"Pooled {evaluation_name} at threshold 0.50")
     print("  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}".format(*pooled))
-    thresholds = np.arange(0.10, 0.901, 0.01)
-    swept = np.asarray([metrics(y, oof, threshold) for threshold in thresholds])
-    best = int(np.argmax(swept[:, 2]))
-    print("OOF threshold-tuning diagnostic (NOT an independent test result)")
+    swept, best = threshold_sweep(y, oof)
+    print("Best raw OOF threshold diagnostic — NOT an independent test result")
     print("  threshold={:.2f}  Sensitivity={:.4f}  PPV={:.4f}  F1={:.4f}  Accuracy={:.4f}"
-          .format(thresholds[best], *swept[best]))
+          .format(THRESHOLDS[best], *swept[best]))
+    smoothing_summary, smoothing_sweep, best_smoothed = smoothing_diagnostics(
+        y, oof, patient_id)
+    print("\nOOF diagnostic — NOT an independent test result")
+    print(smoothing_summary.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
     results_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(results_dir / f"oof_predictions_{cv_mode}_{feature_set}.npz",
-                        probability_a=oof,
-                        y_true=y, patient_id=patient_id, threshold_0_50=np.float32(0.5),
-                        best_oof_threshold=np.float32(thresholds[best]))
-    patient_results = patient_performance(y, oof, patient_id, thresholds[best])
-    patient_results.to_csv(
-        results_dir / f"patient_performance_{cv_mode}_{feature_set}.csv", index=False)
+    suffix = f"{cv_mode}_{feature_set}_{spo2_window_mode}"
+    patient_results = patient_performance(y, oof, patient_id, THRESHOLDS[best])
+    if save_outputs:
+        np.savez_compressed(results_dir / f"oof_predictions_{suffix}.npz",
+                            probability_a=oof, y_true=y, patient_id=patient_id,
+                            threshold_0_50=np.float32(0.5),
+                            best_oof_threshold=np.float32(THRESHOLDS[best]))
+        patient_results.to_csv(results_dir / f"patient_performance_{suffix}.csv", index=False)
+        smoothing_summary.to_csv(
+            results_dir / f"smoothing_summary_{suffix}.csv", index=False)
+        smoothing_sweep.to_csv(
+            results_dir / f"smoothing_threshold_sweep_{suffix}.csv", index=False)
+        performance = pd.DataFrame([{
+            "cv_method": cv_mode, "feature_set": feature_set,
+            "spo2_window_mode": spo2_window_mode,
+            "number_of_patients": patients.size, "number_of_features": x.shape[1],
+            "A_seconds": int(y.sum()), "N_seconds": int(y.size - y.sum()),
+            "pooled_sensitivity_050": pooled[0], "pooled_ppv_050": pooled[1],
+            "pooled_f1_050": pooled[2], "pooled_accuracy_050": pooled[3],
+            "best_raw_threshold": THRESHOLDS[best],
+            "best_raw_threshold_sensitivity": swept[best, 0],
+            "best_raw_threshold_ppv": swept[best, 1],
+            "best_raw_threshold_f1": swept[best, 2],
+            "best_raw_threshold_accuracy": swept[best, 3],
+            "best_smoothing_window": int(best_smoothed["window"]),
+            "best_smoothed_threshold": best_smoothed["best_threshold"],
+            "best_smoothed_sensitivity": best_smoothed["best_sens"],
+            "best_smoothed_ppv": best_smoothed["best_ppv"],
+            "best_smoothed_f1": best_smoothed["best_f1"],
+            "best_smoothed_accuracy": best_smoothed["best_accuracy"],
+        }])
+        performance.to_csv(results_dir / f"model_performance_{suffix}.csv", index=False)
 
     if cv_mode == "logo":
         patient_scores = patient_results[["sensitivity_050", "ppv_050", "f1_050",
@@ -546,13 +665,15 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
         importance = pd.DataFrame({"feature": feature_names,
                                    "importance": final_model.feature_importances_})
         importance = importance.sort_values("importance", ascending=False)
-        importance.to_csv(results_dir / f"feature_importance_{feature_set}.csv", index=False)
-        final_model.save_model(str(results_dir / f"xgboost_model_{feature_set}.json"))
+        importance.to_csv(results_dir / f"feature_importance_{suffix}.csv", index=False)
+        final_model.save_model(str(results_dir / f"xgboost_model_{suffix}.json"))
         print("\nTop 20 feature importances")
         print(importance.head(20).to_string(index=False))
 
     return {"feature_set": feature_set, "features": x.shape[1], "pooled": pooled,
-            "patient_results": patient_results}
+            "patient_results": patient_results, "oof": oof,
+            "raw_sweep": swept, "raw_best": best,
+            "smoothing_summary": smoothing_summary, "best_smoothed": best_smoothed}
 
 
 def print_ablation_comparison(results, results_dir, cv_mode):
@@ -602,6 +723,54 @@ def print_ablation_comparison(results, results_dir, cv_mode):
     print(comparison.nsmallest(10, "all_minus_spo2_f1").to_string(index=False))
 
 
+def run_xgb_grid_search(x, y, patient_id, feature_names, device, results_dir,
+                        feature_set, spo2_window_mode):
+    """Run the fixed development grid on one materialised set of patient folds."""
+    splits = materialise_splits(x, y, patient_id, "5fold")
+    fold_signature = [(train.copy(), validation.copy()) for train, validation in splits]
+    rows = []
+    for max_depth, min_child_weight, reg_lambda in itertools.product(
+            (4, 5, 6), (5, 10), (1.0, 3.0, 5.0)):
+        assert all(np.array_equal(train, saved_train) and
+                   np.array_equal(validation, saved_validation)
+                   for (train, validation), (saved_train, saved_validation)
+                   in zip(splits, fold_signature))
+        params = {"max_depth": max_depth, "min_child_weight": min_child_weight,
+                  "reg_lambda": reg_lambda}
+        print(f"\nGrid-search candidate: {params}")
+        result = run_cross_validation(
+            x, y, patient_id, feature_names, device, results_dir, "5fold", feature_set,
+            train_final_model=False, spo2_window_mode=spo2_window_mode,
+            model_params=params, splits=splits, save_outputs=False)
+        pooled, swept, best = result["pooled"], result["raw_sweep"], result["raw_best"]
+        smoothed = result["best_smoothed"]
+        rows.append({
+            **params, "sensitivity_050": pooled[0], "ppv_050": pooled[1],
+            "f1_050": pooled[2], "accuracy_050": pooled[3],
+            "best_raw_threshold": THRESHOLDS[best],
+            "best_raw_threshold_sensitivity": swept[best, 0],
+            "best_raw_threshold_ppv": swept[best, 1],
+            "best_raw_threshold_f1": swept[best, 2],
+            "best_raw_threshold_accuracy": swept[best, 3],
+            "best_smoothing_window": int(smoothed["window"]),
+            "best_smoothed_threshold": smoothed["best_threshold"],
+            "best_smoothed_sensitivity": smoothed["best_sens"],
+            "best_smoothed_ppv": smoothed["best_ppv"],
+            "best_smoothed_f1": smoothed["best_f1"],
+            "best_smoothed_accuracy": smoothed["best_accuracy"],
+        })
+    grid = pd.DataFrame(rows)
+    assert len(grid) == 18
+    results_dir.mkdir(parents=True, exist_ok=True)
+    grid.to_csv(results_dir / (
+        f"xgb_grid_search_5fold_{feature_set}_{spo2_window_mode}.csv"), index=False)
+    print("\nGrid search (primary comparison: raw pooled OOF F1 at threshold 0.50)")
+    print("Threshold/smoothing optimisation: OOF diagnostic — NOT an independent test result")
+    print(grid.sort_values("f1_050", ascending=False).to_string(
+        index=False, float_format=lambda value: f"{value:.4f}"))
+    return grid
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", help="Path to ProjectTrainData.mat")
@@ -612,10 +781,18 @@ def main():
     parser.add_argument("--features", choices=("all", "ecg", "spo2", "compare"),
                         default="all", help="Feature set to evaluate")
     parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--spo2-windows", choices=("baseline", "extended"),
+                        default="baseline", help="SpO2 rolling-window configuration")
+    parser.add_argument("--tune-xgb", action="store_true",
+                        help="Run the fixed 18-candidate development grid (5-fold only)")
     args = parser.parse_args()
+    if args.tune_xgb and args.cv != "5fold":
+        parser.error("--tune-xgb currently requires --cv 5fold")
+    if args.tune_xgb and args.features == "compare":
+        parser.error("--tune-xgb requires one feature set, not --features compare")
     root = Path(__file__).resolve().parent
     selected = DEV20 if args.patients == "dev20" else None
-    cache_path = root / "cache" / "train_features.npz"
+    cache_path = root / "cache" / f"train_features_{args.spo2_windows}.npz"
     x, y, patient_id, feature_names = load_or_build_cache(args, selected, cache_path)
     feature_names = feature_names.astype(str)
     feature_masks = {
@@ -630,6 +807,9 @@ def main():
     assert np.all(np.char.startswith(ecg_names, "ecg_"))
     assert x.shape[0] == y.size == patient_id.size
     assert x.shape[1] == feature_names.size
+    assert np.unique(feature_names).size == feature_names.size
+    spo2_names = feature_names[feature_masks["spo2"]]
+    assert np.all(np.char.startswith(spo2_names, "spo2_"))
     print(f"\nPatients: {np.unique(patient_id).size}\nSeconds: {y.size:,}"
           f"\nA labels: {(y == 1).sum():,}\nN labels: {(y == 0).sum():,}"
           f"\nECG features: {feature_masks['ecg'].sum()}"
@@ -641,13 +821,20 @@ def main():
     labels = {"ecg": "ECG only", "spo2": "SpO2 only", "all": "All"}
     requested_sets = ("ecg", "spo2", "all") if args.features == "compare" else (args.features,)
     device = choose_device(args.device)
+    if args.tune_xgb:
+        feature_set = args.features
+        mask = feature_masks[feature_set]
+        run_xgb_grid_search(x[:, mask], y, patient_id, feature_names[mask], device,
+                            root / "results", feature_set, args.spo2_windows)
+        return
     results = []
     for feature_set in requested_sets:
         mask = feature_masks[feature_set]
         print(f"\n{'=' * 72}\n{labels[feature_set]}: {mask.sum()} features\n{'=' * 72}")
         results.append(run_cross_validation(
             x[:, mask], y, patient_id, feature_names[mask], device, root / "results",
-            args.cv, feature_set, train_final_model=args.features != "compare"))
+            args.cv, feature_set, train_final_model=args.features != "compare",
+            spo2_window_mode=args.spo2_windows))
     if args.features == "compare":
         print_ablation_comparison(results, root / "results", args.cv)
 
