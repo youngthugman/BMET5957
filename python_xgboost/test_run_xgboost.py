@@ -19,8 +19,8 @@ class ECGFeatureExtractionTests(unittest.TestCase):
         qrs = qrs_seconds * 100 + 1
         features, names = run_xgboost.extract_ecg_features(qrs, 100, 80)
 
-        self.assertEqual(features.shape, (80, 65))
-        self.assertEqual(len(names), 65)
+        self.assertEqual(features.shape, (80, 131))
+        self.assertEqual(len(names), 131)
         self.assertEqual(len(set(names)), len(names))
         self.assertTrue(all(name.startswith("ecg_") for name in names))
         self.assertEqual(names[:10], [

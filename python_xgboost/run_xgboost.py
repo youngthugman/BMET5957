@@ -3,7 +3,6 @@
 
 import argparse
 import importlib.util
-import itertools
 import subprocess
 from pathlib import Path
 
@@ -26,9 +25,13 @@ except ImportError:  # scikit-learn before 1.1
 DEV20 = np.array([1, 3, 9, 12, 15, 17, 18, 30, 33, 36, 37, 38,
                   42, 47, 50, 57, 61, 72, 77, 94])
 FIELDS = ("ECG", "SpO2", "Class", "SR_ECG", "SR_SpO2")
-ECG_EXTRACTOR_VERSION = "submission2-group5-qrs-multiscale-ecg-v2"
-SPO2_EXTRACTOR_VERSION = "rolling-windows-v1"
-SPO2_WINDOWS = {"baseline": (21, 61), "extended": (21, 41, 61, 91)}
+ECG_EXTRACTOR_VERSION = "submission2-group5-qrs-multiscale-ecg-v3"
+SPO2_EXTRACTOR_VERSION = "spo2-multiscale-morphology-v3"
+SPO2_WINDOWS = {
+    "baseline": (21, 61),
+    "extended": (11, 21, 31, 41, 51, 61, 91, 121),
+}
+ECG_LONG_WINDOWS = (30, 60, 90)
 SMOOTHING_WINDOWS = (1, 3, 5, 7, 10)
 THRESHOLDS = np.round(np.arange(0.10, 0.901, 0.01), 2)
 assert 0.50 in THRESHOLDS and 0.75 in THRESHOLDS
@@ -238,6 +241,77 @@ def extract_ecg_features(qrs, sample_rate, n_seconds):
         names.extend([f"ecg_rr_mean_{short_window}s_minus_41s",
                       f"ecg_hr_mean_{short_window}s_minus_41s"])
 
+    # Multiscale context added in v3. These rolling windows are trailing (causal).
+    long_rr_means, long_hr_means, long_rmssd, long_pnn50, long_sdnn = {}, {}, {}, {}, {}
+    for long_window in ECG_LONG_WINDOWS:
+        min_periods = max(5, long_window // 4)
+        rr_roll = rr_series.rolling(long_window, min_periods=min_periods)
+        hr_roll = hr_series.rolling(long_window, min_periods=min_periods)
+        rr_stats = {"mean": rr_roll.mean(), "min": rr_roll.min(), "max": rr_roll.max()}
+        hr_stats = {"mean": hr_roll.mean(), "std": hr_roll.std(),
+                    "min": hr_roll.min(), "max": hr_roll.max()}
+        rr_stats["range"] = rr_stats["max"] - rr_stats["min"]
+        hr_stats["range"] = hr_stats["max"] - hr_stats["min"]
+        long_rr_means[long_window] = rr_stats["mean"]
+        long_hr_means[long_window] = hr_stats["mean"]
+        for statistic in ("mean", "min", "max", "range"):
+            columns.append(rr_stats[statistic].to_numpy())
+            names.append(f"ecg_rr_{statistic}_{long_window}s")
+        columns.append(causal_slope(current_rr, long_window, min_periods))
+        names.append(f"ecg_rr_slope_{long_window}s")
+        for statistic in ("mean", "std", "min", "max", "range"):
+            columns.append(hr_stats[statistic].to_numpy())
+            names.append(f"ecg_hr_{statistic}_{long_window}s")
+        columns.append(causal_slope(hr_series.to_numpy(), long_window, min_periods))
+        names.append(f"ecg_hr_slope_{long_window}s")
+
+        # SDNN is the RR standard deviation, so no duplicate rr_std column is added.
+        long_sdnn[long_window] = rr_roll.std()
+        diff_roll = rr_diff.rolling(long_window, min_periods=min_periods)
+        long_rmssd[long_window] = np.sqrt(
+            diff_roll.apply(lambda values: np.mean(values ** 2), raw=True))
+        long_pnn50[long_window] = rr_diff.abs().gt(0.05).rolling(
+            long_window, min_periods=min_periods).mean()
+        for metric, values_ in (("sdnn", long_sdnn[long_window]),
+                                ("rmssd", long_rmssd[long_window]),
+                                ("pnn50", long_pnn50[long_window])):
+            columns.append(values_.to_numpy())
+            names.append(f"ecg_{metric}_{long_window}s")
+
+        columns.extend([(rr_series - rr_stats["mean"]).to_numpy(),
+                        (hr_series - hr_stats["mean"]).to_numpy()])
+        names.extend([f"ecg_rr_vs_{long_window}s_mean",
+                      f"ecg_hr_vs_{long_window}s_mean"])
+
+    for long_window in (60, 90):
+        for short_window in (5, 10, 20):
+            columns.extend([
+                (rr_means[short_window] - long_rr_means[long_window]).to_numpy(),
+                (hr_means[short_window] - long_hr_means[long_window]).to_numpy(),
+            ])
+            names.extend([
+                f"ecg_rr_mean_{short_window}s_minus_{long_window}s",
+                f"ecg_hr_mean_{short_window}s_minus_{long_window}s",
+            ])
+
+    rmssd_20 = np.sqrt(rr_diff.rolling(20, min_periods=5).apply(
+        lambda values: np.mean(values ** 2), raw=True))
+    pnn50_20 = rr_diff.abs().gt(0.05).rolling(20, min_periods=5).mean()
+    columns.extend([(rmssd_20 - long_rmssd[60]).to_numpy(),
+                    (long_rmssd[30] - long_rmssd[90]).to_numpy(),
+                    (pnn50_20 - long_pnn50[60]).to_numpy(),
+                    (long_pnn50[30] - long_pnn50[90]).to_numpy()])
+    names.extend(["ecg_rmssd_20s_minus_60s", "ecg_rmssd_30s_minus_90s",
+                  "ecg_pnn50_20s_minus_60s", "ecg_pnn50_30s_minus_90s"])
+    for metric, short, long in (("sdnn", long_sdnn[30], long_sdnn[90]),
+                                ("rmssd", long_rmssd[30], long_rmssd[90])):
+        denominator = long.to_numpy()
+        ratio = np.divide(short.to_numpy(), denominator,
+                          out=np.full(n_seconds, np.nan),
+                          where=np.isfinite(denominator) & (np.abs(denominator) > 1e-8))
+        columns.append(ratio)
+        names.append(f"ecg_{metric}_30s_div_90s")
+
     rr_delta = rr_series.diff()
     hr_delta = hr_series.diff()
     columns.extend([hr_delta.to_numpy(), rr_delta.to_numpy(),
@@ -250,6 +324,7 @@ def extract_ecg_features(qrs, sample_rate, n_seconds):
     assert features.shape[0] == n_seconds
     assert features.shape[1] == len(names)
     assert len(names) == len(set(names)) and all(name.startswith("ecg_") for name in names)
+    assert not np.isinf(features).any()
     return features, names
 
 
@@ -289,35 +364,106 @@ def extract_spo2_features(spo2, sample_rate, n_seconds, windows=(21, 61)):
     values = prepare_spo2(spo2, sample_rate, n_seconds)
     s = pd.Series(values)
     columns, names = [values], ["spo2_current"]
-    rolls = {}
+    causal_rolls = {}
     for window in windows:
-        roll = s.rolling(window, center=True, min_periods=max(3, window // 4))
+        min_periods = max(3, window // 4)
+        # These four durations reproduce the pre-v3 centred context exactly.
+        # They are intentionally retained for experiment comparability and use
+        # future samples. Every feature introduced in v3 uses causal_roll below.
+        is_legacy_window = window in (21, 41, 61, 91)
+        roll = s.rolling(window, center=is_legacy_window, min_periods=min_periods)
+        causal_roll = s.rolling(window, min_periods=min_periods)
+        causal_rolls[window] = causal_roll
         stats = {"mean": roll.mean(), "median": roll.median(), "std": roll.std(),
                  "min": roll.min(), "max": roll.max()}
-        rolls[window] = stats
         for name in ("mean", "median", "std", "min", "max"):
             columns.append(stats[name].to_numpy())
             names.append(f"spo2_{name}_{window}s")
         columns.append((stats["max"] - stats["min"]).to_numpy())
         names.append(f"spo2_range_{window}s")
+        slope = (centred_slope(values, window) if is_legacy_window else
+                 causal_slope(values, window, min_periods))
+        columns.append(slope)
+        names.append(f"spo2_slope_{window}s")
+
+    # Legacy future-looking change and morphology columns are retained unchanged.
     for lag in (5, 10, 20):
         columns.extend([(s - s.shift(lag)).to_numpy(), (s.shift(-lag) - s).to_numpy()])
         names.extend([f"spo2_change_from_{lag}s_ago", f"spo2_change_to_{lag}s_ahead"])
-    columns.extend([(rolls[21]["max"] - s).to_numpy(),
-                    (rolls[61]["median"] - s).to_numpy(),
+    legacy_21 = s.rolling(21, center=True, min_periods=5)
+    legacy_61 = s.rolling(61, center=True, min_periods=15)
+    columns.extend([(legacy_21.max() - s).to_numpy(),
+                    (legacy_61.median() - s).to_numpy(),
                     (s.shift(-1).rolling(20, min_periods=3).min().shift(-19) - s).to_numpy()])
     names.extend(["spo2_drop_from_local_max", "spo2_drop_from_60s_median",
                   "spo2_future_20s_min_minus_current"])
-    for window in windows:
-        columns.append(centred_slope(values, window))
-        names.append(f"spo2_slope_{window}s")
+
+    selected_robust = set(windows).intersection((31, 61, 91, 121))
+    for window in sorted(selected_robust):
+        roll = causal_rolls[window]
+        quantiles = {q: roll.quantile(q / 100.0) for q in (10, 25, 75, 90)}
+        for q in (10, 25, 75, 90):
+            columns.append(quantiles[q].to_numpy())
+            names.append(f"spo2_q{q}_{window}s")
+        columns.append((quantiles[75] - quantiles[25]).to_numpy())
+        names.append(f"spo2_iqr_{window}s")
+
+    for window in sorted(set(windows).intersection((21, 31, 41, 61, 91, 121))):
+        roll = causal_rolls[window]
+        # vs_median is current SpO2 minus the trailing median (signed).
+        columns.extend([(roll.max() - s).to_numpy(),
+                        (roll.quantile(0.90) - s).to_numpy(),
+                        (s - roll.median()).to_numpy()])
+        names.extend([f"spo2_drop_from_max_{window}s",
+                      f"spo2_drop_from_q90_{window}s",
+                      f"spo2_vs_median_{window}s"])
+
+    delta_1 = s.diff()
+    for lag in (1, 3, 5):
+        columns.append((s - s.shift(lag)).to_numpy())
+        names.append(f"spo2_delta_{lag}s")
+    for window in (11, 31, 61):
+        columns.append(delta_1.rolling(window, min_periods=max(3, window // 4)).std().to_numpy())
+        names.append(f"spo2_delta_std_{window}s")
+
+    # Preserve the old centred threshold columns under explicit legacy names.
     for threshold in (90, 92, 95):
         columns.append((s < threshold).astype(float).rolling(61, center=True,
                                                              min_periods=15).mean().to_numpy())
-        names.append(f"spo2_fraction_below_{threshold}_61s")
+        names.append(f"spo2_legacy_centered_fraction_below_{threshold}_61s")
+    below = {threshold: (s < threshold).astype(float) for threshold in (90, 92, 95)}
+    for window in sorted(set(windows).intersection((31, 61, 91, 121))):
+        for threshold in (90, 92, 95):
+            columns.append(below[threshold].rolling(
+                window, min_periods=max(3, window // 4)).mean().to_numpy())
+            names.append(f"spo2_fraction_below_{threshold}_{window}s")
     features = np.column_stack(columns)
+    assert features.shape[0] == n_seconds
     assert features.shape[1] == len(names)
     assert len(names) == len(set(names)) and all(name.startswith("spo2_") for name in names)
+    assert not np.isinf(features).any()
+    return features, names
+
+
+def extract_fusion_features(ecg_x, ecg_names, spo2_x, spo2_names):
+    """Build the small, causal set of explicit oxygen/cardiac interactions."""
+    ecg = {name: ecg_x[:, index] for index, name in enumerate(ecg_names)}
+    spo2 = {name: spo2_x[:, index] for index, name in enumerate(spo2_names)}
+    specifications = [
+        ("fusion_spo2drop61_hrdev60", "spo2_drop_from_q90_61s", "ecg_hr_vs_60s_mean"),
+        ("fusion_spo2drop91_hrdev90", "spo2_drop_from_q90_91s", "ecg_hr_vs_90s_mean"),
+        ("fusion_spo2drop121_hrdev90", "spo2_drop_from_q90_121s", "ecg_hr_vs_90s_mean"),
+        ("fusion_spo2drop61_rrdev60", "spo2_drop_from_q90_61s", "ecg_rr_vs_60s_mean"),
+        ("fusion_spo2drop91_rrdev90", "spo2_drop_from_q90_91s", "ecg_rr_vs_90s_mean"),
+        ("fusion_spo2drop121_rrdev90", "spo2_drop_from_q90_121s", "ecg_rr_vs_90s_mean"),
+    ]
+    available = [(name, spo2_name, ecg_name) for name, spo2_name, ecg_name in specifications
+                 if spo2_name in spo2 and ecg_name in ecg]
+    names = [item[0] for item in available]
+    features = np.column_stack([spo2[spo2_name] * ecg[ecg_name]
+                                for _, spo2_name, ecg_name in available])
+    assert len(names) == len(set(names)) and all(name.startswith("fusion_") for name in names)
+    assert not np.isinf(features).any()
     return features, names
 
 
@@ -332,9 +478,12 @@ def extract_patient_features(data, patient_index, spo2_windows=(21, 61)):
     ecg_x, ecg_names = extract_ecg_features(detected_qrs + 1, ecg_rate, n)
     spo2_x, spo2_names = extract_spo2_features(
         data["SpO2"][patient_index], spo2_rate, n, spo2_windows)
-    x = np.column_stack((ecg_x, spo2_x)).astype(np.float32)
+    fusion_x, fusion_names = extract_fusion_features(
+        ecg_x, ecg_names, spo2_x, spo2_names)
+    x = np.column_stack((ecg_x, spo2_x, fusion_x)).astype(np.float32)
     assert x.shape[0] == y.size == n, "Feature extraction changed annotation length"
-    return x, y, ecg_names + spo2_names
+    assert not np.isinf(x).any(), "Feature matrix contains infinity"
+    return x, y, ecg_names + spo2_names + fusion_names
 
 
 def build_feature_cache(data_path, selected_patients, cache_path, spo2_window_mode="baseline"):
@@ -405,13 +554,12 @@ def metrics(y, probability, threshold=0.5):
                      accuracy_score(y, prediction)])
 
 
-def make_model(device, weight, model_params=None):
-    model_params = model_params or {}
+def make_model(device, weight):
     return XGBClassifier(objective="binary:logistic", n_estimators=600,
-                         learning_rate=0.05, max_depth=model_params.get("max_depth", 6),
-                         min_child_weight=model_params.get("min_child_weight", 5),
+                         learning_rate=0.05, max_depth=6,
+                         min_child_weight=5,
                          subsample=0.8, colsample_bytree=0.8,
-                         reg_lambda=model_params.get("reg_lambda", 1.0),
+                         reg_lambda=1.0,
                          tree_method="hist", device=device, random_state=42,
                          scale_pos_weight=weight, n_jobs=-1)
 
@@ -429,8 +577,8 @@ def choose_device(requested):
     return "cuda"
 
 
-def fit_model(x, y, device, weight, model_params=None):
-    model = make_model(device, weight, model_params)
+def fit_model(x, y, device, weight):
+    model = make_model(device, weight)
     try:
         model.fit(x, y)
         return model, device
@@ -438,7 +586,7 @@ def fit_model(x, y, device, weight, model_params=None):
         if device != "cuda":
             raise
         print(f"CUDA training failed ({error}); retrying this and later models on CPU.")
-        model = make_model("cpu", weight, model_params)
+        model = make_model("cpu", weight)
         model.fit(x, y)
     return model, "cpu"
 
@@ -537,10 +685,30 @@ def patient_performance(y, probability, patient_id, best_threshold):
     return pd.DataFrame(rows)
 
 
+def feature_family(name):
+    """Map a feature name to one descriptive importance family."""
+    if name.startswith("fusion_"):
+        return "Fusion interactions"
+    if name.startswith("ecg_"):
+        if any(token in name for token in ("rmssd", "pnn50", "sdnn")):
+            return "ECG HRV"
+        if "_vs_" in name or "_minus_" in name or "_div_" in name:
+            return "ECG short-vs-long"
+        if any(f"_{window}s" in name for window in ECG_LONG_WINDOWS):
+            return "ECG long context"
+        return "ECG short dynamics"
+    if "fraction_below" in name:
+        return "SpO2 threshold/persistence"
+    if any(token in name for token in ("drop_from", "vs_median", "delta")):
+        return "SpO2 desaturation morphology"
+    if any(token in name for token in ("_q10_", "_q25_", "_q75_", "_q90_", "_iqr_")):
+        return "SpO2 robust distribution"
+    return "SpO2 basic context"
+
+
 def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
                          cv_mode="5fold", feature_set="all", train_final_model=True,
-                         spo2_window_mode="baseline", model_params=None, splits=None,
-                         save_outputs=True):
+                         spo2_window_mode="baseline", splits=None, save_outputs=True):
     assert x.shape[0] == y.size == patient_id.size
     assert set(np.unique(y)).issubset({0, 1}) and 1 in y, "A must be positive class 1"
     patients = np.unique(patient_id)
@@ -578,7 +746,7 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
                   f"\n  scale_pos_weight: {weight:.4f}")
         # This weight is intentionally derived only from this fold's training rows.
         assert negative + positive == train.size
-        model, device = fit_model(x[train], y[train], device, weight, model_params)
+        model, device = fit_model(x[train], y[train], device, weight)
         oof[validation] = model.predict_proba(x[validation])[:, 1]
         oof_count[validation] += 1
         scores = metrics(y[validation], oof[validation])
@@ -666,6 +834,15 @@ def run_cross_validation(x, y, patient_id, feature_names, device, results_dir,
                                    "importance": final_model.feature_importances_})
         importance = importance.sort_values("importance", ascending=False)
         importance.to_csv(results_dir / f"feature_importance_{suffix}.csv", index=False)
+        if feature_set == "all":
+            family_importance = (importance.assign(
+                family=importance["feature"].map(feature_family))
+                .groupby("family", as_index=False)["importance"].sum()
+                .sort_values("importance", ascending=False))
+            family_importance.to_csv(
+                results_dir / f"feature_family_importance_{suffix}.csv", index=False)
+            print("Feature importance is descriptive; correlated features may divide "
+                  "importance among themselves. It is not used to delete features.")
         final_model.save_model(str(results_dir / f"xgboost_model_{suffix}.json"))
         print("\nTop 20 feature importances")
         print(importance.head(20).to_string(index=False))
@@ -723,54 +900,6 @@ def print_ablation_comparison(results, results_dir, cv_mode):
     print(comparison.nsmallest(10, "all_minus_spo2_f1").to_string(index=False))
 
 
-def run_xgb_grid_search(x, y, patient_id, feature_names, device, results_dir,
-                        feature_set, spo2_window_mode):
-    """Run the fixed development grid on one materialised set of patient folds."""
-    splits = materialise_splits(x, y, patient_id, "5fold")
-    fold_signature = [(train.copy(), validation.copy()) for train, validation in splits]
-    rows = []
-    for max_depth, min_child_weight, reg_lambda in itertools.product(
-            (4, 5, 6), (5, 10), (1.0, 3.0, 5.0)):
-        assert all(np.array_equal(train, saved_train) and
-                   np.array_equal(validation, saved_validation)
-                   for (train, validation), (saved_train, saved_validation)
-                   in zip(splits, fold_signature))
-        params = {"max_depth": max_depth, "min_child_weight": min_child_weight,
-                  "reg_lambda": reg_lambda}
-        print(f"\nGrid-search candidate: {params}")
-        result = run_cross_validation(
-            x, y, patient_id, feature_names, device, results_dir, "5fold", feature_set,
-            train_final_model=False, spo2_window_mode=spo2_window_mode,
-            model_params=params, splits=splits, save_outputs=False)
-        pooled, swept, best = result["pooled"], result["raw_sweep"], result["raw_best"]
-        smoothed = result["best_smoothed"]
-        rows.append({
-            **params, "sensitivity_050": pooled[0], "ppv_050": pooled[1],
-            "f1_050": pooled[2], "accuracy_050": pooled[3],
-            "best_raw_threshold": THRESHOLDS[best],
-            "best_raw_threshold_sensitivity": swept[best, 0],
-            "best_raw_threshold_ppv": swept[best, 1],
-            "best_raw_threshold_f1": swept[best, 2],
-            "best_raw_threshold_accuracy": swept[best, 3],
-            "best_smoothing_window": int(smoothed["window"]),
-            "best_smoothed_threshold": smoothed["best_threshold"],
-            "best_smoothed_sensitivity": smoothed["best_sens"],
-            "best_smoothed_ppv": smoothed["best_ppv"],
-            "best_smoothed_f1": smoothed["best_f1"],
-            "best_smoothed_accuracy": smoothed["best_accuracy"],
-        })
-    grid = pd.DataFrame(rows)
-    assert len(grid) == 18
-    results_dir.mkdir(parents=True, exist_ok=True)
-    grid.to_csv(results_dir / (
-        f"xgb_grid_search_5fold_{feature_set}_{spo2_window_mode}.csv"), index=False)
-    print("\nGrid search (primary comparison: raw pooled OOF F1 at threshold 0.50)")
-    print("Threshold/smoothing optimisation: OOF diagnostic — NOT an independent test result")
-    print(grid.sort_values("f1_050", ascending=False).to_string(
-        index=False, float_format=lambda value: f"{value:.4f}"))
-    return grid
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", help="Path to ProjectTrainData.mat")
@@ -783,13 +912,7 @@ def main():
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--spo2-windows", choices=("baseline", "extended"),
                         default="baseline", help="SpO2 rolling-window configuration")
-    parser.add_argument("--tune-xgb", action="store_true",
-                        help="Run the fixed 18-candidate development grid (5-fold only)")
     args = parser.parse_args()
-    if args.tune_xgb and args.cv != "5fold":
-        parser.error("--tune-xgb currently requires --cv 5fold")
-    if args.tune_xgb and args.features == "compare":
-        parser.error("--tune-xgb requires one feature set, not --features compare")
     root = Path(__file__).resolve().parent
     selected = DEV20 if args.patients == "dev20" else None
     cache_path = root / "cache" / f"train_features_{args.spo2_windows}.npz"
@@ -798,6 +921,7 @@ def main():
     feature_masks = {
         "ecg": np.char.startswith(feature_names, "ecg_"),
         "spo2": np.char.startswith(feature_names, "spo2_"),
+        "fusion": np.char.startswith(feature_names, "fusion_"),
         "all": np.ones(feature_names.size, dtype=bool),
     }
     if not feature_masks["ecg"].any() or not feature_masks["spo2"].any():
@@ -808,25 +932,24 @@ def main():
     assert x.shape[0] == y.size == patient_id.size
     assert x.shape[1] == feature_names.size
     assert np.unique(feature_names).size == feature_names.size
+    assert not np.isinf(x).any(), "Feature matrix contains infinity (NaN is permitted)"
+    known_prefix = (feature_masks["ecg"] | feature_masks["spo2"] |
+                    feature_masks["fusion"])
+    assert known_prefix.all(), "Every feature must use an ecg_, spo2_, or fusion_ prefix"
     spo2_names = feature_names[feature_masks["spo2"]]
     assert np.all(np.char.startswith(spo2_names, "spo2_"))
     print(f"\nPatients: {np.unique(patient_id).size}\nSeconds: {y.size:,}"
           f"\nA labels: {(y == 1).sum():,}\nN labels: {(y == 0).sum():,}"
           f"\nECG features: {feature_masks['ecg'].sum()}"
           f"\nSpO2 features: {feature_masks['spo2'].sum()}"
-          f"\nCombined features: {x.shape[1]}"
+          f"\nFusion features: {feature_masks['fusion'].sum()}"
+          f"\nTotal combined features: {x.shape[1]}"
           f"\nFeature matrix RAM: {x.nbytes / 2**30:.2f} GiB")
     print("ECG feature names:")
     print("  " + "\n  ".join(ecg_names))
     labels = {"ecg": "ECG only", "spo2": "SpO2 only", "all": "All"}
     requested_sets = ("ecg", "spo2", "all") if args.features == "compare" else (args.features,)
     device = choose_device(args.device)
-    if args.tune_xgb:
-        feature_set = args.features
-        mask = feature_masks[feature_set]
-        run_xgb_grid_search(x[:, mask], y, patient_id, feature_names[mask], device,
-                            root / "results", feature_set, args.spo2_windows)
-        return
     results = []
     for feature_set in requested_sets:
         mask = feature_masks[feature_set]
