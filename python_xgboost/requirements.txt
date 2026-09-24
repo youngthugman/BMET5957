@@ -3,5 +3,6 @@ scipy
 pandas
 scikit-learn>=1.1
 xgboost>=2.0
+torch
 tqdm
 h5py
