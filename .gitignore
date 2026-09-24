@@ -1,8 +1,0 @@
-Cache/
-Results/
-*.asv
-python_xgboost/cache/
-python_xgboost/results/
-
-__pycache__/
-*.py[cod]

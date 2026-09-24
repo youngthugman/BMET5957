@@ -1,0 +1,4 @@
+Check these first:
+1. you have all required modules installed
+2. you have set the file path in CNN_CACHE.PY for the training data
+3. you have ran CNN_CACHE.PY before running CNN_EVALUATION.PY (need to generate cache first)
