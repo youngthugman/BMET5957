@@ -9,18 +9,43 @@ import numpy as np
 
 MODEL_VERSION = "Kye-MLP-native-blobs-v2"
 NATIVE = Path(__file__).with_name("native_mlp")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FEATURE_EXTRACTION_RUNTIME_FILE = REPO_ROOT / "_native_mlp_runtime" / "feature_extraction.py"
+QRS_DETECTOR = (
+    REPO_ROOT
+    / "Submission2_Group5_FINAL"
+    / "Submission2_Group5_FINAL"
+    / "reference-data"
+    / "Anthony-V2"
+    / "Code"
+    / "qrs_detector_causal.py"
+)
 
 
-def _load(name, filename, aliases=()):
+def _load(name, filename, aliases=(), runtime_file=None):
     spec = importlib.util.spec_from_file_location(name, NATIVE / filename)
-    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    module = importlib.util.module_from_spec(spec)
+    if runtime_file is None:
+        spec.loader.exec_module(module)
+    else:
+        # feature_extraction.py locates the submitted QRS detector relative to
+        # __file__.  Preserve its exact source bytes while recreating the path
+        # context in which the submission expects to run.
+        module.__file__ = str(runtime_file)
+        source = (NATIVE / filename).read_bytes()
+        exec(compile(source, str(runtime_file), "exec"), module.__dict__)
     for alias in aliases: sys.modules.setdefault(alias, module)
     return module
 
 
 config = _load("ensemble_native_mlp_config", "config.py", ("config",))
 data_loader = _load("ensemble_native_mlp_data_loader", "data_loader.py", ("data_loader",))
-feature_extraction = _load("ensemble_native_mlp_features", "feature_extraction.py", ("feature_extraction",))
+feature_extraction = _load(
+    "ensemble_native_mlp_features",
+    "feature_extraction.py",
+    ("feature_extraction",),
+    runtime_file=FEATURE_EXTRACTION_RUNTIME_FILE,
+)
 native_model = _load("ensemble_native_mlp_model", "model.py", ("model",))
 
 

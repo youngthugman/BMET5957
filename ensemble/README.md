@@ -18,6 +18,12 @@ python .\ensemble\run_ensemble.py `
   --models cnn mlp
 ```
 
+To rerun only the native Group 5 MLP reproduction, use:
+
+```powershell
+python .\ensemble\run_ensemble.py --mode reproduce --data "E:\Desktop\Downloads\ProjectTrainData.mat" --device cuda --models mlp
+```
+
 This writes `results/native_reproduction_cnn.csv` and
 `results/native_reproduction_mlp.csv`. Every run first performs the fail-closed
 blob and scientific-setting audit in `results/source_fidelity_audit.txt`.
