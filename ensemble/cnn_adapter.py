@@ -1,89 +1,157 @@
-"""Shared-fold adapter around the actual Kye-1D_CNN Python model family."""
+"""Thin in-memory adapter for the byte-for-byte vendored Kye CNN."""
 from __future__ import annotations
 
 import copy
+import importlib.util
+from pathlib import Path
+
 import numpy as np
 
-from .kye_cnn.cnn_cache import CHANNEL_NAMES, CONTEXT_WINDOWS
-from .kye_cnn.cnn_evaluation import ContextDataset, predict_all
+MODEL_VERSION = "Kye-1D_CNN-native-blobs-v2"
+NATIVE = Path(__file__).with_name("native_cnn")
 
-MODEL_VERSION = "Kye-1D_CNN-Python-MultiScaleAttentionModel-v1"
+
+def _module(name, filename):
+    spec = importlib.util.spec_from_file_location(name, NATIVE / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+native_cache = _module("ensemble_native_cnn_cache", "cnn_cache.py")
+native_model = _module("ensemble_native_cnn_model", "cnn_model.py")
+
+
+def build_cnn_features(data, lengths=None):
+    """Build native channel-first features from supplied MAT-file QRS values."""
+    if "QRS" not in data:
+        raise ValueError("Native CNN requires the supplied QRS variable")
+    values = []
+    for index, (spo2, qrs) in enumerate(zip(data["SpO2"], data["QRS"])):
+        value = native_cache.build_patient_features(spo2, qrs)
+        if value.shape[0] != native_model.NUM_CHANNELS:
+            raise ValueError(f"Native CNN patient {index + 1} produced {value.shape[0]} channels")
+        if lengths is not None and value.shape[1] != lengths[index]:
+            raise ValueError(f"Native CNN patient {index + 1} length mismatch")
+        values.append(value)
+    return values
+
+
+class _WindowDataset:
+    def __init__(self, patients, labels, indices):
+        import torch
+        self.torch, self.patients, self.labels, self.indices = torch, patients, labels, indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, item):
+        patient, second = self.indices[item]
+        features = self.patients[patient]
+        contexts = []
+        for window in (31, 61, 91, 121):
+            half = window // 2
+            start, end = second - half, second + half + 1
+            left, right = max(0, -start), max(0, end - features.shape[1])
+            chunk = features[:, max(0, start):min(features.shape[1], end)]
+            if left or right:
+                chunk = np.pad(chunk, ((0, 0), (left, right)), mode="edge")
+            contexts.append(self.torch.from_numpy(chunk))
+        return contexts, self.torch.tensor(float(self.labels[patient][second]), dtype=self.torch.float32)
 
 
 class CNNAdapter:
-    def __init__(self, device="cpu", epochs=30, batch_size=256, seed=42, patience=5):
+    """Native normalization, sampling, architecture, loss, and optimization."""
+    def __init__(self, device="cpu", epochs=12, batch_size=512, seed=42, patience=4):
         self.device, self.epochs, self.batch_size = device, epochs, batch_size
         self.seed, self.patience, self.model = seed, patience, None
-        self.median = self.mean = self.std = None
 
-    def _normalise(self, patients, fit=False):
-        if fit:
-            joined = np.concatenate(patients)
-            self.median = np.nanmedian(joined, 0); self.median[~np.isfinite(self.median)] = 0
-            clean = np.where(np.isfinite(joined), joined, self.median)
-            self.mean, self.std = clean.mean(0), clean.std(0); self.std[self.std < 1e-6] = 1
-        return [((np.where(np.isfinite(value), value, self.median) - self.mean) / self.std).astype(np.float32)
-                for value in patients]
+    @staticmethod
+    def _normalise(features):
+        # This is a direct transcription of the final normalise_features definition.
+        output = []
+        for features_i in features:
+            x = features_i.astype(np.float32, copy=True)
+            x[0] = (x[0] - 100) / 10; x[1:3] /= 2
+            x[3:7] = (x[3:7] - 100) / 10; x[7:11] /= 2; x[11:15] /= 5
+            x[15:19] = (x[15:19] - 100) / 10; x[19:26] /= 5; x[26:29] /= 10
+            x[29] = (x[29] - 70) / 30; x[30] /= 10; x[31] = (x[31] - 1) / .5
+            x[32] /= .25; x[33] /= 15; x[34] /= .25
+            output.append(x)
+        return output
 
-    def fit(self, features, labels, logger=None):
-        """Retain weighted sampling, BCE loss, AdamW, and patient-held-out early stopping."""
+    def _indices(self, labels, fold_seed):
+        rng, indices = np.random.default_rng(fold_seed), []
+        for patient, target in enumerate(labels):
+            positive, negative = np.flatnonzero(target == 1), np.flatnonzero(target == 0)
+            if not len(positive):
+                chosen = rng.choice(negative, size=min(1500, len(negative)), replace=False)
+                indices.extend((patient, int(i)) for i in chosen); continue
+            n_pos, n_neg = min(450, len(positive)), min(1050, len(negative))
+            indices.extend((patient, int(i)) for i in rng.choice(positive, n_pos, replace=len(positive) < n_pos))
+            indices.extend((patient, int(i)) for i in rng.choice(negative, n_neg, replace=len(negative) < n_neg))
+        rng.shuffle(indices)
+        return indices
+
+    def fit(self, features, labels, logger=None, validation_features=None, validation_labels=None, fold=1):
         import torch
-        from .kye_cnn.cnn_model import MultiScaleAttentionModel
-        torch.manual_seed(self.seed); np.random.seed(self.seed)
-        if any(value.shape[1] != len(CHANNEL_NAMES) for value in features):
-            raise ValueError("Kye CNN input must contain its original 35 channels")
-        # The early-stop patients are selected solely from this outer-training set.
-        order = np.random.default_rng(self.seed).permutation(len(features))
-        n_monitor = max(1, round(.1 * len(order)))
-        monitor_patients, fit_patients = set(order[:n_monitor]), set(order[n_monitor:])
-        if not fit_patients: fit_patients, monitor_patients = set(order), set()
-        normalised = self._normalise(features, fit=True)
-        all_labels = np.concatenate(labels)
-        mapping = [(p, s) for p, value in enumerate(features) for s in range(len(value))]
-        train_indices = np.array([i for i, (p, _) in enumerate(mapping) if p in fit_patients])
-        monitor_indices = np.array([i for i, (p, _) in enumerate(mapping) if p in monitor_patients])
-        train_targets = all_labels[train_indices]
-        counts = np.bincount(train_targets.astype(int), minlength=2)
-        sample_weights = (1 / np.maximum(counts, 1))[train_targets.astype(int)]
-        sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(train_indices), replacement=True)
-        train_data = ContextDataset(normalised, labels, train_indices)
-        train_loader = torch.utils.data.DataLoader(train_data, self.batch_size, sampler=sampler)
-        monitor_loader = None
-        if monitor_indices.size:
-            monitor_loader = torch.utils.data.DataLoader(
-                ContextDataset(normalised, labels, monitor_indices), self.batch_size, shuffle=False)
-        self.model = MultiScaleAttentionModel(input_channels=35).to(self.device)
-        positive_weight = counts[0] / max(counts[1], 1)
-        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(positive_weight, device=self.device))
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-3, weight_decay=1e-4)
-        best, best_state, stale = float("inf"), None, 0
+        torch.manual_seed(self.seed + fold); np.random.seed(self.seed + fold)
+        train_x = self._normalise(features)
+        train_indices = self._indices(labels, self.seed + fold)
+        loader = torch.utils.data.DataLoader(_WindowDataset(train_x, labels, train_indices), self.batch_size,
+                                             shuffle=True, num_workers=0, pin_memory=self.device == "cuda")
+        valid_loader = None
+        if validation_features is not None:
+            valid_x = self._normalise(validation_features)
+            valid_indices = [(p, s) for p, target in enumerate(validation_labels) for s in range(len(target))]
+            valid_loader = torch.utils.data.DataLoader(_WindowDataset(valid_x, validation_labels, valid_indices),
+                                                       self.batch_size, shuffle=False, num_workers=0)
+        self.model = native_model.MultiScaleAttentionModel(num_channels=35).to(self.device)
+        criterion = torch.nn.BCEWithLogitsLoss()  # deliberately no pos_weight
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=.001, weight_decay=1e-4)
+        scaler = torch.amp.GradScaler("cuda", enabled=self.device == "cuda")
+        best, state, stale = -1., None, 0
         for epoch in range(self.epochs):
-            self.model.train(); total = 0.
-            for contexts, target in train_loader:
-                optimizer.zero_grad()
-                loss = criterion(self.model([x.to(self.device) for x in contexts]), target.to(self.device))
-                loss.backward(); optimizer.step(); total += float(loss.detach()) * len(target)
-            monitor_loss = total / len(train_data)
-            if monitor_loader:
-                self.model.eval(); summed = count = 0
-                with torch.no_grad():
-                    for contexts, target in monitor_loader:
-                        loss = criterion(self.model([x.to(self.device) for x in contexts]), target.to(self.device))
-                        summed += float(loss) * len(target); count += len(target)
-                monitor_loss = summed / count
-            if logger: logger.debug("CNN epoch %d/%d loss=%.6f monitor=%.6f", epoch + 1, self.epochs, total / len(train_data), monitor_loss)
-            if monitor_loss < best - 1e-5:
-                best, best_state, stale = monitor_loss, copy.deepcopy(self.model.state_dict()), 0
+            self.model.train()
+            for contexts, target in loader:
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=str(self.device).split(":")[0], enabled=self.device == "cuda"):
+                    loss = criterion(self.model([x.to(self.device) for x in contexts]), target.to(self.device))
+                scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+            if valid_loader is None:
+                continue
+            probability = self._predict_loader(valid_loader)
+            truth = np.concatenate(validation_labels)
+            predicted = probability >= .5
+            tp, fp, fn = np.sum(predicted & (truth == 1)), np.sum(predicted & (truth == 0)), np.sum(~predicted & (truth == 1))
+            score = 2 * tp / max(2 * tp + fp + fn, 1)
+            if logger: logger.debug("CNN fold %d epoch %d/%d validation F1=%.6f", fold, epoch + 1, self.epochs, score)
+            if score > best:
+                best, state, stale = score, copy.deepcopy(self.model.state_dict()), 0
             else:
                 stale += 1
                 if stale >= self.patience: break
-        if best_state is not None: self.model.load_state_dict(best_state)
+        if state is not None: self.model.load_state_dict(state)
         return self
 
+    def _predict_loader(self, loader):
+        import torch
+        self.model.eval(); result = []
+        with torch.no_grad():
+            for contexts, _ in loader:
+                with torch.autocast(device_type=str(self.device).split(":")[0], enabled=self.device == "cuda"):
+                    probability = torch.sigmoid(self.model([x.to(self.device) for x in contexts]))
+                result.append(probability.float().cpu().numpy())
+        return np.concatenate(result).astype(np.float32)
+
     def predict_proba(self, features):
-        return predict_all(self.model, self._normalise(features), self.device, self.batch_size)
+        dummy = [np.zeros(value.shape[1], np.uint8) for value in features]
+        indices = [(p, s) for p, value in enumerate(features) for s in range(value.shape[1])]
+        loader = __import__("torch").utils.data.DataLoader(_WindowDataset(self._normalise(features), dummy, indices),
+                                                           self.batch_size, shuffle=False, num_workers=0)
+        return self._predict_loader(loader)
 
     def close(self):
         import torch
-        del self.model; self.model = None
+        self.model = None
         if torch.cuda.is_available(): torch.cuda.empty_cache()

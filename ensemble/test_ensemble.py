@@ -5,8 +5,9 @@ from scipy.io import savemat, loadmat
 from ensemble.alignment import align_predictions, make_shared_folds
 from ensemble.ensemble_methods import diversity, weighted_search
 from ensemble.submission import create_submission, validate_submission
-from ensemble.kye_cnn.cnn_cache import CHANNEL_NAMES, CONTEXT_WINDOWS, build_patient_features
-from ensemble.kye_mlp.feature_extraction import FEATURE_NAMES, extract_patient_features
+from ensemble.cnn_adapter import native_cache, native_model
+from ensemble.mlp_adapter import native_model as native_mlp_model
+from ensemble.source_fidelity import audit
 
 
 def test_shared_folds_and_alignment(tmp_path):
@@ -47,24 +48,21 @@ def test_submission_preserves_orientation_and_only_class(tmp_path):
         assert set(actual.ravel()) <= {"A", "N"}
 
 
-def test_source_model_representations_and_architectures():
+def test_source_model_representations_and_architectures(tmp_path):
     seconds = 130
-    ecg = np.sin(np.arange(seconds * 50) / 10)
     spo2 = np.full(seconds, 96.)
-    cnn = build_patient_features(ecg, spo2, 50, 1, seconds)
-    mlp = extract_patient_features(ecg, spo2, 50, 1, seconds)
-    assert cnn.shape == (seconds, 35) and len(CHANNEL_NAMES) == 35
-    assert mlp.shape == (seconds, len(FEATURE_NAMES)) and mlp.shape[1] != 262
-    assert CONTEXT_WINDOWS == (31, 61, 91, 121)
+    qrs = np.arange(0, seconds * 200, 200)
+    cnn = native_cache.build_patient_features(spo2, qrs)
+    assert cnn.shape == (35, seconds) and native_model.NUM_CHANNELS == 35
+    assert native_model.MultiScaleAttentionModel().windows == [31, 61, 91, 121]
+    assert "OVERALL: MATCH" in audit(tmp_path / "audit.txt")
 
 
 def test_source_torch_architectures():
     import pytest
     torch = pytest.importorskip("torch")
-    from ensemble.kye_cnn.cnn_model import MultiScaleAttentionModel
-    from ensemble.kye_mlp.model import MLPClassifier
-    cnn_model = MultiScaleAttentionModel()
-    contexts = [torch.zeros(2, window, 35) for window in CONTEXT_WINDOWS]
+    cnn_model = native_model.MultiScaleAttentionModel()
+    contexts = [torch.zeros(2, 35, window) for window in (31, 61, 91, 121)]
     assert cnn_model(contexts).shape == (2,)
-    linear = [layer for layer in MLPClassifier(30).network if isinstance(layer, torch.nn.Linear)]
+    linear = [layer for layer in native_mlp_model.MLP(30).network if isinstance(layer, torch.nn.Linear)]
     assert [(layer.in_features, layer.out_features) for layer in linear] == [(30, 128), (128, 64), (64, 1)]

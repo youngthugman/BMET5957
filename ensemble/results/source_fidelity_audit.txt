@@ -1,0 +1,26 @@
+SOURCE FIDELITY AUDIT
+BLOB native_cnn/cnn_cache.py expected=266ea6a5445e04af092746ea73d0f8894f5e12c5 actual=266ea6a5445e04af092746ea73d0f8894f5e12c5 MATCH
+BLOB native_cnn/cnn_model.py expected=24e81ceedbfae4dec72270530cfda2ec96db9aad actual=24e81ceedbfae4dec72270530cfda2ec96db9aad MATCH
+BLOB native_cnn/cnn_evaluation.py expected=d239f7e70b172d6f14a306fab02fbe07cdf6ad1c actual=d239f7e70b172d6f14a306fab02fbe07cdf6ad1c MATCH
+BLOB native_mlp/cache.py expected=4008833725f9239cbfa2258651c581938cc4d367 actual=4008833725f9239cbfa2258651c581938cc4d367 MATCH
+BLOB native_mlp/config.py expected=c8a3497fed8a0e9a75dbfc0b971790b011c92320 actual=c8a3497fed8a0e9a75dbfc0b971790b011c92320 MATCH
+BLOB native_mlp/data_loader.py expected=c622ddd8ffe0e4ecd7a69562df2dc642a0986d24 actual=c622ddd8ffe0e4ecd7a69562df2dc642a0986d24 MATCH
+BLOB native_mlp/feature_extraction.py expected=68ea0b2db91d2ec832c2c99e57ac4bd428807a73 actual=68ea0b2db91d2ec832c2c99e57ac4bd428807a73 MATCH
+BLOB native_mlp/model.py expected=956241a4179a6fec23b261d57180f359942c4b5f actual=956241a4179a6fec23b261d57180f359942c4b5f MATCH
+BLOB native_mlp/evaluation.py expected=b4d69bc9bfa60bed921a050984fa5dbd1a220821 actual=b4d69bc9bfa60bed921a050984fa5dbd1a220821 MATCH
+BLOB native_mlp/main.py expected=c118cf5dd6724e1b2bcfd1ece71380da78e13fdc actual=c118cf5dd6724e1b2bcfd1ece71380da78e13fdc MATCH
+SETTING CNN channel count: MATCH
+SETTING CNN context windows: MATCH
+SETTING CNN samples/patient: MATCH
+SETTING CNN positive fraction: MATCH
+SETTING CNN max epochs: MATCH
+SETTING CNN patience: MATCH
+SETTING CNN learning rate: MATCH
+SETTING CNN weight decay: MATCH
+SETTING CNN batch size: MATCH
+SETTING CNN unweighted BCE: MATCH
+SETTING CNN supplied QRS: MATCH
+SETTING MLP mean imputer: MATCH
+SETTING MLP StandardScaler: MATCH
+SETTING MLP architecture: MATCH
+OVERALL: MATCH
