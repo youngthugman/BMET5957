@@ -8,6 +8,31 @@ MLP receives its own raw-signal feature representation.
 
 ## Development run
 
+First reproduce the two branch-native evaluations:
+
+```powershell
+python .\ensemble\run_ensemble.py `
+  --mode reproduce `
+  --data "E:\Desktop\Downloads\ProjectTrainData.mat" `
+  --device cuda `
+  --models cnn mlp
+```
+
+This writes `results/native_reproduction_cnn.csv` and
+`results/native_reproduction_mlp.csv`. Every run first performs the fail-closed
+blob and scientific-setting audit in `results/source_fidelity_audit.txt`.
+
+Then run only the three base models on shared folds:
+
+```powershell
+python .\ensemble\run_ensemble.py `
+  --mode cv `
+  --data "E:\Desktop\Downloads\ProjectTrainData.mat" `
+  --device cuda `
+  --cv 5fold `
+  --base-models-only
+```
+
 ```powershell
 python .\ensemble\run_ensemble.py `
   --mode cv `
@@ -65,14 +90,17 @@ release CUDA memory between models.
 
 ## Source preservation
 
-The adapted CNN sources live under `kye_cnn/` using the original source names:
+The authoritative byte-for-byte CNN sources live under `native_cnn/`:
 `cnn_cache.py`, `cnn_model.py`, and `cnn_evaluation.py`. Its fixed representation
 is 35 channels, and `MultiScaleAttentionModel` receives centred contexts of 31,
-61, 91, and 121 seconds. The shared-fold adapter retains normalization, weighted
-training sampling, weighted binary loss, AdamW, and patient-only early stopping.
+61, 91, and 121 seconds. The adapter retains native normalization, 1,500 samples
+per patient with a 30% positive target, unweighted `BCEWithLogitsLoss`, AdamW,
+and validation-F1 early stopping. It uses the MAT file's supplied `QRS` and does
+not run the Group 5 detector.
 
-The adapted MLP sources live under `kye_mlp/` using the original source names:
-`model.py`, `feature_extraction.py`, `evaluation.py`, and `main.py`. Its network
+The authoritative byte-for-byte MLP sources live under `native_mlp/`. Its network
 is `Linear(input,128) → LayerNorm → GELU → Dropout(0.25) → Linear(128,64) →
-LayerNorm → GELU → Dropout(0.25) → Linear(64,1)`. Median imputation and
-standardisation are fitted exclusively on outer-training patients.
+LayerNorm → GELU → Dropout(0.25) → Linear(64,1)`. Mean `SimpleImputer`
+preprocessing and `StandardScaler` are fitted exclusively on training patients.
+The MLP independently runs its native extractor and never consumes CNN channels
+or XGBoost's 262-feature matrix.

@@ -13,13 +13,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ensemble.alignment import (align_predictions, load_prediction_cache, make_shared_folds,
                                 save_prediction_cache, second_indices)
-from ensemble.cnn_adapter import CNNAdapter, MODEL_VERSION as CNN_VERSION
-from ensemble.kye_cnn.cnn_cache import build_cnn_features
+from ensemble.cnn_adapter import CNNAdapter, MODEL_VERSION as CNN_VERSION, build_cnn_features
 from ensemble.ensemble_methods import (best_threshold, diversity, make_meta_model, meta_features,
                                        metrics, weighted_search)
 from ensemble.logging_utils import configure_logging
-from ensemble.mlp_adapter import MLPAdapter, MODEL_VERSION as MLP_VERSION
-from ensemble.kye_mlp.feature_extraction import build_mlp_features
+from ensemble.mlp_adapter import MLPAdapter, MODEL_VERSION as MLP_VERSION, build_mlp_features, data_loader as mlp_data_loader
+from ensemble.source_fidelity import audit as audit_source
 from ensemble.submission import create_submission, load_template
 from ensemble.xgb_adapter import XGBAdapter, MODEL_VERSION as XGB_VERSION
 from python_xgboost.run_xgboost import (SPO2_WINDOWS, build_feature_cache, extract_patient_features,
@@ -28,7 +27,7 @@ from python_xgboost.run_xgboost import (SPO2_WINDOWS, build_feature_cache, extra
 ROOT = Path(__file__).resolve().parent
 VERSIONS = {"cnn": CNN_VERSION, "mlp": MLP_VERSION, "xgb": XGB_VERSION}
 SOURCE = {"cnn": "Kye-1D_CNN", "mlp": "Kye-MLP", "xgb": "19926-XGBoost-Tuning"}
-FEATURE_VERSION = {"cnn": "Kye-1D_CNN-35-channel-v1", "mlp": "Kye-MLP-native-v1",
+FEATURE_VERSION = {"cnn": "Kye-1D_CNN-exact-blobs-35-channel-v2", "mlp": "Kye-MLP-exact-blobs-native-v2",
                    "xgb": "262-extended-v3"}
 
 
@@ -40,15 +39,21 @@ def load_or_build_native_features(name, raw, lengths, cache_path, builder, logge
         if str(cached.get("feature_version", "")) == expected and np.array_equal(cached["lengths"], lengths):
             logger.debug("Loaded %s native feature cache: %s", name, cache_path)
             joined, offsets = cached["features"], np.cumsum(cached["lengths"])[:-1]
-            return list(np.split(joined, offsets)) if name == "cnn" else joined
+            if name == "cnn": return [part.T for part in np.split(joined, offsets)]
+            return joined, cached["feature_names"].astype(str)
         logger.debug("Rejected %s native feature cache: version or lengths differ", name)
-    values = builder(raw, lengths)
-    joined = np.concatenate(values)
+    if name == "cnn":
+        values = builder(raw, lengths); joined = np.concatenate([value.T for value in values])
+        feature_names = np.asarray([], dtype=str)
+    else:
+        joined, native_y, feature_names = builder(raw)
+        if len(native_y) != sum(lengths): raise ValueError("Native MLP label coverage mismatch")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = cache_path.with_suffix(".tmp.npz")
-    np.savez_compressed(temporary, features=joined, lengths=np.asarray(lengths), feature_version=np.asarray(expected))
+    np.savez_compressed(temporary, features=joined, lengths=np.asarray(lengths), feature_names=feature_names,
+                        feature_version=np.asarray(expected))
     temporary.replace(cache_path)
-    return values if name == "cnn" else joined
+    return values if name == "cnn" else (joined, feature_names)
 
 
 def adapter(name, args):
@@ -69,7 +74,8 @@ def fit_predict(name, representations, y, patient_id, train, valid, args, logger
         if name == "cnn":
             train_x, train_y = _patient_lists(representations["cnn"], y, patient_id, train)
             valid_x, _ = _patient_lists(representations["cnn"], y, patient_id, valid)
-            model.fit(train_x, train_y, logger)
+            valid_y = [y[patient_id == patient] for patient in np.unique(patient_id[valid])]
+            model.fit(train_x, train_y, logger, validation_features=valid_x, validation_labels=valid_y)
             probability = model.predict_proba(valid_x)
         elif name == "mlp":
             model.fit(representations["mlp"][train], y[train], patient_id[train], logger)
@@ -113,6 +119,73 @@ def save_method(name, y, probability, frame, results, evaluation_type, notes="")
             "notes": notes + f"; diagnostic best threshold={threshold:.2f}, F1={diagnostic['f1']:.6f}"}
 
 
+def _load_native_raw(path, require_qrs=True):
+    raw = mlp_data_loader.load_training_data(path)
+    if not require_qrs: return raw
+    import h5py
+    from scipy.io import loadmat
+    if h5py.is_hdf5(path):
+        with h5py.File(path, "r") as handle:
+            if "QRS" not in handle: raise ValueError("Native CNN requires QRS in ProjectTrainData.mat")
+            raw["QRS"] = mlp_data_loader._hdf5_cells(handle, "QRS")
+    else:
+        qrs_mat = loadmat(path, variable_names=("QRS",), squeeze_me=False)
+        if "QRS" not in qrs_mat: raise ValueError("Native CNN requires QRS in ProjectTrainData.mat")
+        raw["QRS"] = mlp_data_loader._scipy_cells(qrs_mat["QRS"])
+    return raw
+
+
+def run_reproduce(args, logger):
+    """Reproduce each branch's own native patient-fold evaluation independently."""
+    from sklearn.model_selection import KFold, GroupKFold
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+    except ImportError:
+        StratifiedGroupKFold = None
+    results, cache = ROOT / "results", ROOT / "cache"
+    results.mkdir(parents=True, exist_ok=True); cache.mkdir(parents=True, exist_ok=True)
+    raw = _load_native_raw(args.data, require_qrs="cnn" in args.models)
+    lengths = [len(mlp_data_loader.clean_labels(value)) for value in raw["Class"]]
+    y = np.concatenate([mlp_data_loader.clean_labels(value) for value in raw["Class"]])
+    patient_id = np.concatenate([np.full(length, i + 1, np.int16) for i, length in enumerate(lengths)])
+    mlp_x = feature_names = None
+    if "mlp" in args.models:
+        mlp_x, native_y, feature_names = build_mlp_features(raw)
+        if not np.array_equal(y, native_y): raise ValueError("Native MLP labels are not aligned")
+        feature_hash = __import__("hashlib").sha256("\n".join(feature_names).encode()).hexdigest()
+        logger.info("Native MLP feature count=%d feature-name SHA-256=%s", len(feature_names), feature_hash)
+    for name in args.models:
+        oof = np.full(len(y), np.nan, np.float32)
+        if name == "cnn":
+            cnn = build_cnn_features(raw, lengths)
+            splits = KFold(n_splits=5, shuffle=True, random_state=42).split(np.arange(len(lengths)))
+            for fold, (train_patients, valid_patients) in enumerate(splits, 1):
+                model = CNNAdapter(args.device, args.cnn_epochs, args.cnn_batch_size)
+                try:
+                    tx, ty = [cnn[i] for i in train_patients], [y[patient_id == i + 1] for i in train_patients]
+                    vx, vy = [cnn[i] for i in valid_patients], [y[patient_id == i + 1] for i in valid_patients]
+                    model.fit(tx, ty, logger, validation_features=vx, validation_labels=vy, fold=fold)
+                    positions = np.concatenate([np.flatnonzero(patient_id == i + 1) for i in valid_patients])
+                    oof[positions] = model.predict_proba(vx)
+                finally: model.close()
+        else:
+            splitter = (StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+                        if StratifiedGroupKFold else GroupKFold(n_splits=5))
+            for fold, (train, valid) in enumerate(splitter.split(mlp_x, y, groups=patient_id), 1):
+                model = MLPAdapter(args.device, args.mlp_epochs, args.mlp_batch_size)
+                try:
+                    model.fit(mlp_x[train], y[train], patient_id[train], logger)
+                    oof[valid] = model.predict_proba(mlp_x[valid])
+                finally: model.close()
+        if not np.isfinite(oof).all(): raise RuntimeError(f"Native {name} reproduction has incomplete OOF predictions")
+        score = metrics(y, oof); score["predicted_positive_fraction"] = float(np.mean(oof >= .5))
+        pd.DataFrame([{ "model": name, **score }]).to_csv(results / f"native_reproduction_{name}.csv", index=False)
+        np.savez_compressed(cache / f"native_reproduction_{name}.npz", probability_a=oof, y_true=y,
+                            patient_id=patient_id, second_index=second_indices(patient_id), model_version=VERSIONS[name])
+        logger.info("Native %s: sensitivity=%.4f PPV=%.4f F1=%.4f accuracy=%.4f predicted-positive=%.4f",
+                    name.upper(), score["sensitivity"], score["ppv"], score["f1"], score["accuracy"], score["predicted_positive_fraction"])
+
+
 def nested_stacking(frame, representations, row_fold, args, cache, logger, kind):
     output = np.full(len(frame), np.nan, np.float32)
     ids, y = frame.patient_id.to_numpy(), frame.y_true.to_numpy()
@@ -149,13 +222,14 @@ def run_cv(args, logger):
     args.patients, args.rebuild_cache, args.spo2_windows = "all", args.rebuild_cache, "extended"
     x, y, patient_id, names = load_or_build_cache(args, selected, feature_cache)
     if x.shape[1] != 262: raise ValueError(f"Canonical extended feature count must be 262, got {x.shape[1]}")
-    raw = load_training_data(args.data)
+    raw = _load_native_raw(args.data)
     label_lengths = [int(np.sum(patient_id == patient)) for patient in np.unique(patient_id)]
     cnn_features = load_or_build_native_features(
         "cnn", raw, label_lengths, cache / "cnn_native_features.npz", build_cnn_features, logger)
-    mlp_features = load_or_build_native_features(
+    mlp_features, mlp_names = load_or_build_native_features(
         "mlp", raw, label_lengths, cache / "mlp_native_features.npz", build_mlp_features, logger)
-    assert len(mlp_features) == len(y) and sum(map(len, cnn_features)) == len(y)
+    assert len(mlp_features) == len(y) and sum(value.shape[1] for value in cnn_features) == len(y)
+    logger.info("Native MLP features: %d; name SHA-256: %s", len(mlp_names), __import__('hashlib').sha256("\n".join(mlp_names).encode()).hexdigest())
     representations = {"cnn": cnn_features, "mlp": mlp_features, "xgb": x}
     row_fold = make_shared_folds(y, patient_id, results / "shared_patient_folds.csv")
     index = second_indices(patient_id); outputs = {}; timings = []
@@ -198,6 +272,9 @@ def run_cv(args, logger):
     logger.info("\n%-12s %-35s %s", "MODEL", "ORIGINAL INPUT IMPLEMENTATION", "SHARED-FOLD OOF F1")
     for row in base_summary.itertuples(index=False):
         logger.info("%-12s %-35s %.4f", row.model, row.original_input_implementation, row.shared_fold_oof_f1)
+    if args.base_models_only:
+        print(base_summary.to_string(index=False, float_format=lambda value: f"{value:.4f}"))
+        return
     hard = (np.sum(p >= .5, axis=1) >= 2).astype(np.uint8)
     np.savez_compressed(results / "oof_predictions_5fold_hard_majority_vote.npz", prediction=hard,
                         y_true=y_aligned, patient_id=frame.patient_id, second_index=frame.second_index)
@@ -229,18 +306,23 @@ def run_cv(args, logger):
 def run_test(args, logger):
     # Training uses precisely the same canonical feature cache/extractor as CV.
     train = load_training_data(args.train_data)
+    train_native = _load_native_raw(args.train_data)
     train_x, train_y, train_ids, names = build_feature_cache(args.train_data, None, ROOT / "cache" / "test_train_features.npz", "extended")
     template = load_template(args.annotation_template); lengths = [np.asarray(x).size for x in template.ravel(order="F")]
     # Reuse the canonical loader by supplying template annotations as Class.
     import h5py
     from scipy.io import loadmat
     from python_xgboost.run_xgboost import _hdf5_cells, _scipy_cells
-    fields = ("ECG", "SpO2", "SR_ECG", "SR_SpO2")
+    fields = ("ECG", "SpO2", "SR_ECG", "SR_SpO2", "QRS")
     if h5py.is_hdf5(args.test_data):
         with h5py.File(args.test_data, "r") as handle:
+            missing = [key for key in fields if key not in handle]
+            if missing: raise ValueError("Native test inference requires: " + ", ".join(missing))
             test = {key: _hdf5_cells(handle, key) for key in fields}
     else:
         raw = loadmat(args.test_data, variable_names=fields, squeeze_me=False)
+        missing = [key for key in fields if key not in raw]
+        if missing: raise ValueError("Native test inference requires: " + ", ".join(missing))
         test = {key: _scipy_cells(raw[key]) for key in fields}
     test["Class"] = [np.full(length, "N") for length in lengths]
     xs, ids = [], []
@@ -250,9 +332,11 @@ def run_test(args, logger):
         xs.append(features); ids.append(np.full(len(features), i + 1))
     test_x, test_ids = np.concatenate(xs), np.concatenate(ids)
     train_lengths = [int(np.sum(train_ids == patient)) for patient in np.unique(train_ids)]
-    train_cnn = build_cnn_features(train, train_lengths); test_cnn = build_cnn_features(test, lengths)
-    train_mlp = np.concatenate(build_mlp_features(train, train_lengths))
-    test_mlp = np.concatenate(build_mlp_features(test, lengths))
+    train_cnn = build_cnn_features(train_native, train_lengths); test_cnn = build_cnn_features(test, lengths)
+    train_mlp, native_train_y, train_feature_names = build_mlp_features(train_native)
+    test_mlp, _, test_feature_names = build_mlp_features(test)
+    if not np.array_equal(train_feature_names, test_feature_names): raise ValueError("Native MLP train/test schemas differ")
+    if not np.array_equal(native_train_y, train_y): raise ValueError("Native MLP/XGBoost label alignment differs")
     probabilities = {}
     for name in ("cnn", "mlp", "xgb"):
         prediction_cache = ROOT / "cache" / "test" / f"{name}_predictions.npz"
@@ -298,17 +382,19 @@ def run_test(args, logger):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("cv", "test"), required=True); parser.add_argument("--data")
+    parser.add_argument("--mode", choices=("reproduce", "cv", "test"), required=True); parser.add_argument("--data")
     parser.add_argument("--train-data"); parser.add_argument("--test-data"); parser.add_argument("--annotation-template")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu"); parser.add_argument("--cv", choices=("5fold",), default="5fold")
     parser.add_argument("--methods", default="all"); parser.add_argument("--stacking-mode", choices=("diagnostic", "nested"), default="diagnostic")
     parser.add_argument("--method", default="equal_soft_vote"); parser.add_argument("--config"); parser.add_argument("--group", type=int, default=14)
     parser.add_argument("--submission", type=int, default=1)
-    parser.add_argument("--cnn-epochs", type=int, default=30); parser.add_argument("--mlp-epochs", type=int, default=50)
-    parser.add_argument("--cnn-batch-size", type=int, default=256); parser.add_argument("--mlp-batch-size", type=int, default=2048)
+    parser.add_argument("--models", nargs="+", choices=("cnn", "mlp"), default=("cnn", "mlp"))
+    parser.add_argument("--base-models-only", action="store_true")
+    parser.add_argument("--cnn-epochs", type=int, default=12); parser.add_argument("--mlp-epochs", type=int, default=30)
+    parser.add_argument("--cnn-batch-size", type=int, default=512); parser.add_argument("--mlp-batch-size", type=int, default=512)
     parser.add_argument("--rebuild-cache", action="store_true"); parser.add_argument("--write-aligned-csv", action="store_true"); parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    required = ("data",) if args.mode == "cv" else ("train_data", "test_data", "annotation_template")
+    required = ("data",) if args.mode in ("cv", "reproduce") else ("train_data", "test_data", "annotation_template")
     missing = [key for key in required if not getattr(args, key)]
     if missing: parser.error("missing required arguments: " + ", ".join("--" + x.replace("_", "-") for x in missing))
     return args
@@ -332,7 +418,10 @@ if __name__ == "__main__":
     log.debug("Detailed log: %s; arguments=%s", log_path, vars(arguments))
     resolve_device(arguments, log)
     try:
-        run_cv(arguments, log) if arguments.mode == "cv" else run_test(arguments, log)
+        audit_source()
+        if arguments.mode == "reproduce": run_reproduce(arguments, log)
+        elif arguments.mode == "cv": run_cv(arguments, log)
+        else: run_test(arguments, log)
     except KeyboardInterrupt:
         log.error("Interrupted; completed prediction caches remain available for resume"); raise
     except Exception:
