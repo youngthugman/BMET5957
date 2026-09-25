@@ -67,9 +67,14 @@ python .\ensemble\run_ensemble.py `
 
 For every outer fold, nested mode creates five inner patient folds using only
 outer-training patients. It obtains inner OOF probabilities for all three base
-models, fits each probability-only meta-classifier, and applies it to the three
-cached base predictions for the untouched outer-validation patients. Outer
-validation labels are not used for fitting, preprocessing, or threshold choice.
+models once and stores the shared matrix in
+`cache/nested/outer_<N>/inner_base_predictions.npz`. Weighted voting, logistic
+stacking, and XGBoost meta-ensembling all reuse that matrix, then apply their
+frozen fold-specific weights/model to the cached base predictions for the
+untouched outer-validation patients. Completed outer folds are cached as well,
+so the command is safe to resume. Outer validation labels are not used for
+fitting, preprocessing, weight selection, or threshold choice; nested metrics
+use the fixed 0.50 threshold.
 
 ## Hidden-test submission
 
