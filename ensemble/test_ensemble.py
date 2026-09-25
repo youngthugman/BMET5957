@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from ensemble.mlp_adapter import (
     feature_extraction as native_mlp_features,
     native_model as native_mlp_model,
 )
+from ensemble import run_ensemble
 from ensemble.source_fidelity import ROOT, audit
 
 
@@ -83,6 +85,67 @@ def test_native_mlp_runtime_path_and_source_fidelity():
     assert callable(native_mlp_features.detect_qrs_causal)
     assert "OVERALL: MATCH" in audit()
     assert "OVERALL: MATCH" in (ROOT / "results" / "source_fidelity_audit.txt").read_text()
+
+
+def test_incompatible_native_feature_cache_is_closed_before_windows_replace(tmp_path, monkeypatch):
+    cache_path = tmp_path / "mlp_native_features.npz"
+    np.savez_compressed(
+        cache_path,
+        features=np.zeros((1, 1)),
+        lengths=np.array([1]),
+        feature_names=np.array(["old"]),
+        feature_version=np.array("incompatible"),
+    )
+    real_load = run_ensemble.np.load
+    loaded_cache = None
+
+    class WindowsLockingLoad:
+        """Track the open archive to emulate Windows' replacement restriction."""
+
+        def __init__(self, archive):
+            self.archive = archive
+
+        def __enter__(self):
+            return self.archive.__enter__()
+
+        def __exit__(self, *args):
+            return self.archive.__exit__(*args)
+
+        @property
+        def closed(self):
+            return self.archive.zip is None
+
+    def tracked_load(*args, **kwargs):
+        nonlocal loaded_cache
+        loaded_cache = WindowsLockingLoad(real_load(*args, **kwargs))
+        return loaded_cache
+
+    real_replace = Path.replace
+
+    def windows_replace(source, target):
+        if Path(target) == cache_path and not loaded_cache.closed:
+            raise PermissionError("[WinError 5] destination cache is still open")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(run_ensemble.np, "load", tracked_load)
+    monkeypatch.setattr(Path, "replace", windows_replace)
+    expected_features = np.arange(6).reshape(2, 3)
+    expected_names = np.array(["one", "two", "three"])
+
+    features, names = run_ensemble.load_or_build_native_features(
+        "mlp",
+        raw={},
+        lengths=[2],
+        cache_path=cache_path,
+        builder=lambda raw: (expected_features, np.array([0, 1]), expected_names),
+        logger=logging.getLogger(__name__),
+    )
+
+    assert loaded_cache.closed
+    np.testing.assert_array_equal(features, expected_features)
+    np.testing.assert_array_equal(names, expected_names)
+    with real_load(cache_path, allow_pickle=False) as replaced:
+        assert str(replaced["feature_version"]) == run_ensemble.FEATURE_VERSION["mlp"]
 
 
 def test_source_torch_architectures():

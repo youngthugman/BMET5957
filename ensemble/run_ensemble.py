@@ -35,12 +35,18 @@ def load_or_build_native_features(name, raw, lengths, cache_path, builder, logge
     """Cache native model inputs without object arrays or unsafe pickle loading."""
     expected = FEATURE_VERSION[name]
     if cache_path.exists():
-        cached = np.load(cache_path, allow_pickle=False)
-        if str(cached.get("feature_version", "")) == expected and np.array_equal(cached["lengths"], lengths):
+        with np.load(cache_path, allow_pickle=False) as cached:
+            cache_is_valid = (str(cached.get("feature_version", "")) == expected
+                              and np.array_equal(cached["lengths"], lengths))
+            if cache_is_valid:
+                joined = np.array(cached["features"], copy=True)
+                cached_lengths = np.array(cached["lengths"], copy=True)
+                feature_names = np.array(cached["feature_names"], dtype=str, copy=True)
+        if cache_is_valid:
             logger.debug("Loaded %s native feature cache: %s", name, cache_path)
-            joined, offsets = cached["features"], np.cumsum(cached["lengths"])[:-1]
+            offsets = np.cumsum(cached_lengths)[:-1]
             if name == "cnn": return [part.T for part in np.split(joined, offsets)]
-            return joined, cached["feature_names"].astype(str)
+            return joined, feature_names
         logger.debug("Rejected %s native feature cache: version or lengths differ", name)
     if name == "cnn":
         values = builder(raw, lengths); joined = np.concatenate([value.T for value in values])
