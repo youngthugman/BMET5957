@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import ast
-import hashlib
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -20,9 +20,22 @@ EXPECTED = {
 }
 
 
-def git_blob(data):
-    header = f"blob {len(data)}\0".encode()
-    return hashlib.sha1(header + data).hexdigest()
+def _git_source_state(repo_root, relative):
+    """Return the committed blob SHA and whether the worktree path matches HEAD."""
+    git_path = Path(relative).as_posix()
+    committed = subprocess.run(
+        ["git", "rev-parse", f"HEAD:{git_path}"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    unchanged = subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--", git_path],
+        cwd=repo_root,
+        check=False,
+    ).returncode == 0
+    return committed, unchanged
 
 
 def _constants(path):
@@ -37,8 +50,11 @@ def _constants(path):
 def audit(output=None):
     rows, failures = [], []
     for relative, expected in EXPECTED.items():
-        actual = git_blob((ROOT / relative).read_bytes()); status = "MATCH" if actual == expected else "MISMATCH"
+        repo_relative = Path("ensemble") / relative
+        actual, unchanged = _git_source_state(ROOT.parent, repo_relative)
+        status = "MATCH" if actual == expected and unchanged else "MISMATCH"
         rows.append(f"BLOB {relative} expected={expected} actual={actual} {status}")
+        rows.append(f"WORKTREE {relative}: {'CLEAN' if unchanged else 'MODIFIED'}")
         if status != "MATCH": failures.append(relative)
     cnn_eval = _constants(ROOT / "native_cnn/cnn_evaluation.py")
     cnn_model = _constants(ROOT / "native_cnn/cnn_model.py")

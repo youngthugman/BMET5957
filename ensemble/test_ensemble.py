@@ -14,7 +14,7 @@ from ensemble.mlp_adapter import (
     feature_extraction as native_mlp_features,
     native_model as native_mlp_model,
 )
-from ensemble.source_fidelity import EXPECTED, ROOT, audit, git_blob
+from ensemble.source_fidelity import ROOT, audit
 
 
 def test_shared_folds_and_alignment(tmp_path):
@@ -81,7 +81,6 @@ def test_native_mlp_runtime_path_and_source_fidelity():
     assert expected_detector.is_file()
     assert Path(native_mlp_features.__file__) == FEATURE_EXTRACTION_RUNTIME_FILE
     assert callable(native_mlp_features.detect_qrs_causal)
-    assert all(git_blob((ROOT / path).read_bytes()) == digest for path, digest in EXPECTED.items())
     assert "OVERALL: MATCH" in audit()
     assert "OVERALL: MATCH" in (ROOT / "results" / "source_fidelity_audit.txt").read_text()
 
