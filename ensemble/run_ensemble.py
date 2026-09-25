@@ -192,33 +192,125 @@ def run_reproduce(args, logger):
                     name.upper(), score["sensitivity"], score["ppv"], score["f1"], score["accuracy"], score["predicted_positive_fraction"])
 
 
-def nested_stacking(frame, representations, row_fold, args, cache, logger, kind):
-    output = np.full(len(frame), np.nan, np.float32)
-    ids, y = frame.patient_id.to_numpy(), frame.y_true.to_numpy()
+def _save_npz_atomic(path, **arrays):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp.npz")
+    np.savez_compressed(temporary, **arrays)
+    temporary.replace(path)
+
+
+def _load_inner_predictions(path, y, ids, seconds, logger):
+    """Load an inner OOF cache only when its complete row identity still matches."""
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as saved:
+            probability = np.array(saved["base_probabilities"], copy=True)
+            valid = (probability.shape == (len(y), 3) and np.isfinite(probability).all()
+                     and np.all((probability >= 0) & (probability <= 1))
+                     and np.array_equal(saved["y_true"], y)
+                     and np.array_equal(saved["patient_id"], ids)
+                     and np.array_equal(saved["second_index"], seconds))
+        if not valid:
+            raise ValueError("row identity, shape, or probability validation failed")
+        logger.info("Loaded compatible nested inner base cache %s", path)
+        return probability
+    except Exception as error:
+        logger.info("Rejected nested inner base cache %s: %s", path, error)
+        return None
+
+
+def nested_validation(frame, representations, row_fold, args, cache, results, logger):
+    """Run all nested methods from one shared inner base-prediction matrix per outer fold."""
+    methods = ("nested_weighted_soft_vote", "nested_logistic_stacking", "nested_xgb_meta_ensemble")
+    outputs = {method: np.full(len(frame), np.nan, np.float32) for method in methods}
+    ids, seconds, y = (frame.patient_id.to_numpy(), frame.second_index.to_numpy(),
+                       frame.y_true.to_numpy())
+    per_fold, selected_weights = [], []
     for outer in range(1, 6):
         outer_train, outer_valid = row_fold != outer, row_fold == outer
-        inner_path = cache / "nested" / f"outer_{outer}" / f"{kind}.npz"
-        if inner_path.exists():
-            loaded = np.load(inner_path); output[outer_valid] = loaded["probability_a"]; continue
+        train_patients, valid_patients = np.unique(ids[outer_train]), np.unique(ids[outer_valid])
+        assert not np.intersect1d(train_patients, valid_patients).size, \
+            "Outer training and validation patients overlap"
+        outer_dir = cache / "nested" / f"outer_{outer}"
+        completed_path = outer_dir / "outer_predictions.npz"
+        if completed_path.exists():
+            try:
+                with np.load(completed_path, allow_pickle=False) as saved:
+                    if (not np.array_equal(saved["patient_id"], ids[outer_valid])
+                            or not np.array_equal(saved["second_index"], seconds[outer_valid])
+                            or not np.array_equal(saved["y_true"], y[outer_valid])):
+                        raise ValueError("outer-validation row identity mismatch")
+                    fold_predictions = {method: np.array(saved[method], copy=True) for method in methods}
+                    weights = np.array(saved["weighted_vote_weights"], copy=True)
+                if any(len(value) != outer_valid.sum() or not np.isfinite(value).all()
+                       for value in fold_predictions.values()) or weights.shape != (3,):
+                    raise ValueError("incomplete nested outer cache")
+                for method, probability in fold_predictions.items():
+                    outputs[method][outer_valid] = probability
+                logger.info("Loaded completed nested outer fold %d", outer)
+            except Exception as error:
+                logger.info("Rejected nested outer cache %s: %s", completed_path, error)
+                completed_path.unlink(missing_ok=True)
+            else:
+                selected_weights.append({"outer_fold": outer, "cnn_weight": weights[0],
+                                         "mlp_weight": weights[1], "xgb_weight": weights[2]})
+                for method, probability in fold_predictions.items():
+                    per_fold.append({"method": method, "outer_fold": outer,
+                                     **metrics(y[outer_valid], probability)})
+                continue
+
+        inner_path = outer_dir / "inner_base_predictions.npz"
+        inner_prob = _load_inner_predictions(
+            inner_path, y[outer_train], ids[outer_train], seconds[outer_train], logger)
         inner_fold = make_shared_folds(y[outer_train], ids[outer_train],
-                                       cache / "nested" / f"outer_{outer}" / "inner_folds.csv")
-        inner_prob = np.full((outer_train.sum(), 3), np.nan, np.float32)
-        outer_positions = np.flatnonzero(outer_train)
-        for inner in range(1, 6):
-            train_local, valid_local = inner_fold != inner, inner_fold == inner
-            for column, name in enumerate(("cnn", "mlp", "xgb")):
-                train_mask, valid_mask = np.zeros(len(y), bool), np.zeros(len(y), bool)
-                train_mask[outer_positions[train_local]] = True; valid_mask[outer_positions[valid_local]] = True
-                inner_prob[valid_local, column] = fit_predict(
-                    name, representations, y, ids, train_mask, valid_mask, args, logger)
-        assert np.isfinite(inner_prob).all()
-        meta = make_meta_model(kind).fit(meta_features(inner_prob), y[outer_train])
+                                       outer_dir / "inner_folds.csv")
+        assert not any(np.intersect1d(ids[outer_train][inner_fold != fold],
+                                      ids[outer_train][inner_fold == fold]).size
+                       for fold in range(1, 6))
+        if inner_prob is None:
+            inner_prob = np.full((outer_train.sum(), 3), np.nan, np.float32)
+            outer_positions = np.flatnonzero(outer_train)
+            for inner in range(1, 6):
+                train_local, valid_local = inner_fold != inner, inner_fold == inner
+                for column, name in enumerate(("cnn", "mlp", "xgb")):
+                    train_mask, valid_mask = np.zeros(len(y), bool), np.zeros(len(y), bool)
+                    train_mask[outer_positions[train_local]] = True
+                    valid_mask[outer_positions[valid_local]] = True
+                    assert not np.intersect1d(ids[train_mask], ids[valid_mask]).size
+                    inner_prob[valid_local, column] = fit_predict(
+                        name, representations, y, ids, train_mask, valid_mask, args, logger)
+            assert np.isfinite(inner_prob).all()
+            _save_npz_atomic(inner_path, base_probabilities=inner_prob, y_true=y[outer_train],
+                             patient_id=ids[outer_train], second_index=seconds[outer_train],
+                             inner_fold=inner_fold,
+                             columns=np.asarray(("cnn", "mlp", "xgb")))
+
         base_outer = frame.loc[outer_valid, ["cnn_probability", "mlp_probability", "xgb_probability"]].to_numpy()
-        output[outer_valid] = meta.predict_proba(meta_features(base_outer))[:, 1]
-        inner_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(inner_path, probability_a=output[outer_valid], patient_id=ids[outer_valid])
-    assert np.isfinite(output).all()
-    return output
+        _, best = weighted_search(y[outer_train], inner_prob)
+        weights = best[["cnn_weight", "mlp_weight", "xgb_weight"]].to_numpy(float)
+        fold_predictions = {"nested_weighted_soft_vote": base_outer @ weights}
+        for kind, method in (("logistic_stacking", "nested_logistic_stacking"),
+                             ("xgb_meta_ensemble", "nested_xgb_meta_ensemble")):
+            meta = make_meta_model(kind).fit(meta_features(inner_prob), y[outer_train])
+            fold_predictions[method] = meta.predict_proba(meta_features(base_outer))[:, 1]
+        for method, probability in fold_predictions.items():
+            outputs[method][outer_valid] = probability
+            per_fold.append({"method": method, "outer_fold": outer,
+                             **metrics(y[outer_valid], probability)})
+        selected_weights.append({"outer_fold": outer, "cnn_weight": weights[0],
+                                 "mlp_weight": weights[1], "xgb_weight": weights[2]})
+        _save_npz_atomic(completed_path, patient_id=ids[outer_valid], second_index=seconds[outer_valid],
+                         y_true=y[outer_valid], weighted_vote_weights=weights, **fold_predictions)
+    assert all(np.isfinite(probability).all() for probability in outputs.values())
+    pd.DataFrame(per_fold).sort_values(["method", "outer_fold"]).to_csv(
+        results / "nested_validation_per_outer_fold.csv", index=False)
+    pd.DataFrame(selected_weights).sort_values("outer_fold").to_csv(
+        results / "nested_weighted_vote_weights.csv", index=False)
+    pd.DataFrame([{"method": method, **metrics(y, probability)}
+                  for method, probability in outputs.items()]).to_csv(
+        results / "nested_validation_pooled_metrics.csv", index=False)
+    return outputs
 
 
 def run_cv(args, logger):
@@ -240,7 +332,8 @@ def run_cv(args, logger):
     row_fold = make_shared_folds(y, patient_id, results / "shared_patient_folds.csv")
     index = second_indices(patient_id); outputs = {}; timings = []
     logger.info("=" * 60); logger.info("ENSEMBLE EXPERIMENT"); logger.info("=" * 60)
-    logger.info("Patients: %d\nSeconds: %,d\nDevice: %s\nOuter CV: 5 folds", len(np.unique(patient_id)), len(y), args.device.upper())
+    logger.info("Patients: %d\nSeconds: %s\nDevice: %s\nOuter CV: 5 folds",
+                len(np.unique(patient_id)), f"{len(y):,}", args.device.upper())
     for fold in range(1, 6):
         logger.info("\nFold %d/5", fold); train, valid = row_fold != fold, row_fold == fold
         assert not np.intersect1d(patient_id[train], patient_id[valid]).size
@@ -266,6 +359,9 @@ def run_cv(args, logger):
         logger.info("  saved fold cache; estimated remaining %.1f min", mean_fold * (5 - fold) / 60)
     outputs = {name: {key: np.concatenate([part[key] for part in parts]) for key in parts[0]} for name, parts in outputs.items()}
     frame = align_predictions(outputs, results, args.write_aligned_csv); y_aligned = frame.y_true.to_numpy()
+    patient_folds = {patient: row_fold[np.flatnonzero(patient_id == patient)[0]]
+                     for patient in np.unique(patient_id)}
+    aligned_row_fold = frame.patient_id.map(patient_folds).to_numpy(np.int8)
     p = frame[["cnn_probability", "mlp_probability", "xgb_probability"]].to_numpy()
     summary = [model_report(name, y_aligned, frame[f"{name}_probability"].to_numpy(), frame.patient_id.to_numpy(), results)
                for name in ("cnn", "mlp", "xgb")]
@@ -292,16 +388,25 @@ def run_cv(args, logger):
     summary.append(save_method("weighted_soft_vote", y_aligned, p @ weights, frame, results, "diagnostic",
                                "DIAGNOSTIC — NOT AN INDEPENDENT TEST RESULT"))
     diversity(y_aligned, frame).to_csv(results / "model_diversity.csv", index=False)
-    for kind in ("logistic_stacking", "xgb_meta_ensemble"):
+    if args.stacking_mode == "nested":
         tick = time.monotonic()
-        if args.stacking_mode == "nested":
-            probability = nested_stacking(frame, representations, row_fold, args, cache, logger, kind); evaluation = "nested OOF"; note = "leakage-safe nested patient-wise CV"
-        else:
+        nested_outputs = nested_validation(
+            frame, representations, aligned_row_fold, args, cache, results, logger)
+        for method, probability in nested_outputs.items():
+            summary.append(save_method(method, y_aligned, probability, frame, results, "nested OOF",
+                                       "leakage-safe nested patient-wise CV; fixed threshold=0.50"))
+        timings.append({"stage": "nested_validation", "fold": 0, "start_time": "",
+                        "end_time": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_seconds": time.monotonic() - tick})
+        pd.DataFrame(timings).to_csv(results / "runtime_summary.csv", index=False)
+    else:
+        for kind in ("logistic_stacking", "xgb_meta_ensemble"):
+            tick = time.monotonic()
             model = make_meta_model(kind).fit(meta_features(p), y_aligned)
             probability = model.predict_proba(meta_features(p))[:, 1]; evaluation = "diagnostic"; note = "DIAGNOSTIC ONLY — NOT AN INDEPENDENT RESULT"
-        summary.append(save_method(kind, y_aligned, probability, frame, results, evaluation, note))
-        timings.append({"stage": kind, "fold": 0, "start_time": "", "end_time": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.monotonic() - tick})
-        pd.DataFrame(timings).to_csv(results / "runtime_summary.csv", index=False)
+            summary.append(save_method(kind, y_aligned, probability, frame, results, evaluation, note))
+            timings.append({"stage": kind, "fold": 0, "start_time": "", "end_time": datetime.now(timezone.utc).isoformat(), "elapsed_seconds": time.monotonic() - tick})
+            pd.DataFrame(timings).to_csv(results / "runtime_summary.csv", index=False)
     pd.DataFrame(summary).to_csv(results / "ensemble_summary.csv", index=False)
     configuration = {"method": "equal_soft_vote", "threshold": .5, "cnn_weight": 1/3, "mlp_weight": 1/3,
                      "xgb_weight": 1/3, "threshold_source": "fixed default", "random_seed": 42}

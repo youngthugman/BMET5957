@@ -39,6 +39,54 @@ def test_ensemble_search_and_diversity():
     assert len(diversity(y, frame)) == 3
 
 
+def test_nested_validation_shares_inner_predictions_and_resumes(tmp_path, monkeypatch):
+    patients = np.repeat(np.arange(1, 26), 2)
+    seconds = np.tile(np.arange(2), 25)
+    y = np.tile([0, 1], 25)
+    frame = pd.DataFrame({
+        "patient_id": patients,
+        "second_index": seconds,
+        "y_true": y,
+        "cnn_probability": np.where(y, .8, .2),
+        "mlp_probability": np.where(y, .7, .3),
+        "xgb_probability": np.where(y, .9, .1),
+    })
+    outer_fold = ((patients - 1) % 5 + 1).astype(np.int8)
+    calls = []
+
+    def fake_fit_predict(name, representations, labels, patient_id, train, valid, args, logger):
+        assert not np.intersect1d(patient_id[train], patient_id[valid]).size
+        calls.append((name, tuple(np.unique(patient_id[valid]))))
+        offsets = {"cnn": .15, "mlp": .20, "xgb": .10}
+        return np.where(labels[valid], 1 - offsets[name], offsets[name])
+
+    monkeypatch.setattr(run_ensemble, "fit_predict", fake_fit_predict)
+    cache, results = tmp_path / "cache", tmp_path / "results"
+    results.mkdir()
+    args = object()
+    logger = logging.getLogger(__name__)
+    first = run_ensemble.nested_validation(
+        frame, {}, outer_fold, args, cache, results, logger)
+    assert len(calls) == 5 * 5 * 3
+    assert set(first) == {"nested_weighted_soft_vote", "nested_logistic_stacking",
+                          "nested_xgb_meta_ensemble"}
+    for outer in range(1, 6):
+        path = cache / "nested" / f"outer_{outer}" / "inner_base_predictions.npz"
+        with np.load(path, allow_pickle=False) as saved:
+            assert saved["base_probabilities"].shape == (40, 3)
+        assignments = pd.read_csv(path.parent / "inner_folds.csv")
+        assert assignments.patient_id.is_unique
+    calls.clear()
+    second = run_ensemble.nested_validation(
+        frame, {}, outer_fold, args, cache, results, logger)
+    assert calls == []
+    for method in first:
+        np.testing.assert_array_equal(first[method], second[method])
+    assert len(pd.read_csv(results / "nested_validation_per_outer_fold.csv")) == 15
+    assert len(pd.read_csv(results / "nested_weighted_vote_weights.csv")) == 5
+    assert len(pd.read_csv(results / "nested_validation_pooled_metrics.csv")) == 3
+
+
 def test_submission_preserves_orientation_and_only_class(tmp_path):
     template = np.empty((1, 100), object)
     probabilities = []
