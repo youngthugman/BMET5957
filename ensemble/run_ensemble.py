@@ -493,7 +493,11 @@ def run_test(args, logger):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("reproduce", "cv", "test"), required=True); parser.add_argument("--data")
+    parser.add_argument("--mode", choices=("reproduce", "cv", "test")); parser.add_argument("--data")
+    parser.add_argument("--postprocess-search", action="store_true",
+                        help="search patient-local cleanup rules using cached nested weighted-vote OOF predictions")
+    parser.add_argument("--postprocess-cache", type=Path,
+                        default=ROOT / "results" / "oof_predictions_5fold_nested_weighted_soft_vote.npz")
     parser.add_argument("--train-data"); parser.add_argument("--test-data"); parser.add_argument("--annotation-template")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu"); parser.add_argument("--cv", choices=("5fold",), default="5fold")
     parser.add_argument("--methods", default="all"); parser.add_argument("--stacking-mode", choices=("diagnostic", "nested"), default="diagnostic")
@@ -505,6 +509,12 @@ def parse_args():
     parser.add_argument("--cnn-batch-size", type=int, default=512); parser.add_argument("--mlp-batch-size", type=int, default=512)
     parser.add_argument("--rebuild-cache", action="store_true"); parser.add_argument("--write-aligned-csv", action="store_true"); parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.postprocess_search:
+        if args.mode is not None:
+            parser.error("--postprocess-search is a cache-only standalone mode; omit --mode")
+        return args
+    if args.mode is None:
+        parser.error("one of --mode or --postprocess-search is required")
     required = ("data",) if args.mode in ("cv", "reproduce") else ("train_data", "test_data", "annotation_template")
     missing = [key for key in required if not getattr(args, key)]
     if missing: parser.error("missing required arguments: " + ", ".join("--" + x.replace("_", "-") for x in missing))
@@ -529,6 +539,10 @@ if __name__ == "__main__":
     log.debug("Detailed log: %s; arguments=%s", log_path, vars(arguments))
     resolve_device(arguments, log)
     try:
+        if arguments.postprocess_search:
+            from ensemble.postprocessing import run_search
+            run_search(arguments.postprocess_cache, ROOT / "results")
+            sys.exit(0)
         audit_source()
         if arguments.mode == "reproduce": run_reproduce(arguments, log)
         elif arguments.mode == "cv": run_cv(arguments, log)
