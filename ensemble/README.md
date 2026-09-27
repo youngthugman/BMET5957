@@ -76,6 +76,21 @@ so the command is safe to resume. Outer validation labels are not used for
 fitting, preprocessing, weight selection, or threshold choice; nested metrics
 use the fixed 0.50 threshold.
 
+### Development-set temporal post-processing search
+
+After the nested run has produced its OOF cache, evaluate the eight fixed,
+patient-local temporal cleanup rules without training any model:
+
+```powershell
+python .\ensemble\run_ensemble.py --postprocess-search
+```
+
+This cache-only command uses the nested weighted-soft-vote predictions at the
+fixed 0.50 threshold. It writes `results/postprocessing_search.csv`, a concise
+`results/postprocessing_best.json`, and the best rule's inspectable OOF
+predictions. This is explicitly a **development-set post-processing search**;
+it does not read hidden-test data or change the final submission configuration.
+
 ## Hidden-test submission
 
 ```powershell
